@@ -1,10 +1,112 @@
 ﻿using NAudio.Codecs;
+using NAudio.Dsp;
 using NAudio.Wave;
 using Serilog;
 
 namespace SipBot;
 public static class AudioAlgos
 {
+    /// <summary>
+    /// Normalizes 16-bit PCM audio to a specified maximum amplitude to prevent clipping.
+    /// </summary>
+    public static byte[] NormalizePcmAudio(byte[] pcmAudio, float maxAmplitude = 0.9f)
+    {
+        // Handle odd-length input by padding
+        if (pcmAudio.Length % 2 != 0)
+        {
+            Log.Warning($"Invalid PCM audio length: {pcmAudio.Length} bytes (must be even for 16-bit), padding with 1 byte");
+            byte[] paddedAudio = new byte[pcmAudio.Length + 1];
+            Array.Copy(pcmAudio, paddedAudio, pcmAudio.Length);
+            pcmAudio = paddedAudio;
+        }
+
+        short[] samples = new short[pcmAudio.Length / 2];
+        Buffer.BlockCopy(pcmAudio, 0, samples, 0, pcmAudio.Length);
+
+        float maxSample = samples.Max(s => Math.Abs((float)s));
+        if (maxSample == 0)
+        {
+            Log.Debug("No normalization needed: max sample amplitude is zero");
+            return pcmAudio;
+        }
+
+        float scale = (maxAmplitude * short.MaxValue) / maxSample;
+        for (int i = 0; i < samples.Length; i++)
+        {
+            samples[i] = (short)Math.Clamp(samples[i] * scale, short.MinValue, short.MaxValue);
+        }
+
+        byte[] normalized = new byte[pcmAudio.Length];
+        Buffer.BlockCopy(samples, 0, normalized, 0, pcmAudio.Length);
+        Log.Debug($"Normalized PCM audio: scale factor {scale:F2}, max amplitude {maxAmplitude}");
+        return normalized;
+    }
+
+    /// <summary>
+    /// Resamples PCM audio to the target sample rate, handling variable input sizes.
+    /// </summary>
+    public static byte[] ResamplePcmWithNAudio(byte[] inputPcm, int inputSampleRate, int outputSampleRate)
+    {
+        // Handle odd-length input by padding
+        if (inputPcm.Length % 2 != 0)
+        {
+            Log.Warning($"Invalid input PCM length: {inputPcm.Length} bytes (must be even for 16-bit), padding with 1 byte");
+            byte[] paddedInput = new byte[inputPcm.Length + 1];
+            Array.Copy(inputPcm, paddedInput, inputPcm.Length);
+            inputPcm = paddedInput;
+        }
+
+        // Calculate expected output size
+        int inputSamples = inputPcm.Length / 2; // 16-bit mono
+        double sampleRateRatio = (double)outputSampleRate / inputSampleRate;
+        int expectedOutputSamples = (int)Math.Ceiling(inputSamples * sampleRateRatio);
+        // Ensure even output samples for 16-bit audio
+        if (expectedOutputSamples % 2 != 0)
+            expectedOutputSamples++;
+
+        using var inputStream = new MemoryStream(inputPcm);
+        using var rawSource = new RawSourceWaveStream(inputStream, new WaveFormat(inputSampleRate, 16, 1));
+        var outFormat = new WaveFormat(outputSampleRate, 16, 1);
+
+        using var conversionStream = new WaveFormatConversionStream(outFormat, rawSource);
+        using var outputStream = new MemoryStream();
+        byte[] buffer = new byte[4096];
+        int bytesRead;
+
+        while ((bytesRead = conversionStream.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            outputStream.Write(buffer, 0, bytesRead);
+        }
+
+        byte[] resampled = outputStream.ToArray();
+        Log.Debug($"Resampled audio from {inputSampleRate}Hz to {outputSampleRate}Hz: input {inputPcm.Length} bytes, output {resampled.Length} bytes");
+
+        // Ensure output is even-length and padded to expected size
+        if (resampled.Length % 2 != 0)
+        {
+            byte[] paddedOutput = new byte[resampled.Length + 1];
+            Array.Copy(resampled, paddedOutput, resampled.Length);
+            resampled = paddedOutput;
+        }
+
+        if (resampled.Length < expectedOutputSamples * 2)
+        {
+            byte[] paddedOutput = new byte[expectedOutputSamples * 2];
+            Array.Copy(resampled, paddedOutput, resampled.Length);
+            Log.Debug($"Padded resampled audio from {resampled.Length} to {paddedOutput.Length} bytes to match expected samples");
+            resampled = paddedOutput;
+        }
+        else if (resampled.Length > expectedOutputSamples * 2)
+        {
+            byte[] trimmedOutput = new byte[expectedOutputSamples * 2];
+            Array.Copy(resampled, trimmedOutput, trimmedOutput.Length);
+            Log.Debug($"Trimmed resampled audio from {resampled.Length} to {trimmedOutput.Length} bytes to match expected samples");
+            resampled = trimmedOutput;
+        }
+
+        return resampled;
+    }
+
     /// <summary>
     /// Convert a WAV file (as byte array) to PCMU (G.711 μ-law) encoded byte array at 8kHz mono.
     /// Note that the WAV header is used for the wav data's sample rate info.
@@ -55,30 +157,6 @@ public static class AudioAlgos
             Log.Error(ex, "Failed to convert WAV to raw PCM.");
             return Array.Empty<byte>();
         }
-    }
-
-    /// <summary>
-    /// Resample for 16 bit single channel audio from hz to hz
-    /// </summary>
-    /// <param name="pcm">PCM bytes</param>
-    /// <param name="fromRate">example, 16_000</param>
-    /// <param name="toRate">example, 8_000</param>
-    /// <returns>Resampled bytes</returns>
-    public static byte[] ResamplePcmWithNAudio(byte[] pcm, int fromRate, int toRate)
-    {
-        using var inputStream = new RawSourceWaveStream(new MemoryStream(pcm), new WaveFormat(fromRate, 16, 1));
-        using var resampler = new MediaFoundationResampler(inputStream, new WaveFormat(toRate, 16, 1))
-        {
-            ResamplerQuality = 60
-        };
-        using var ms = new MemoryStream();
-        var buffer = new byte[3200];
-        int bytesRead;
-        while ((bytesRead = resampler.Read(buffer, 0, buffer.Length)) > 0)
-        {
-            ms.Write(buffer, 0, bytesRead);
-        }
-        return ms.ToArray();
     }
 
     /// <summary>
