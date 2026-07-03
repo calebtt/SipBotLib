@@ -1,11 +1,40 @@
 ﻿using NAudio.Codecs;
 using NAudio.Dsp;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using Serilog;
 
 namespace SipBot;
 public static class AudioAlgos
 {
+    /// <summary>
+    /// Resamples/downmixes a sample provider to the target rate using NAudio's managed WDL
+    /// resampler, which (unlike MediaFoundationResampler/WaveFormatConversionStream) has no
+    /// dependency on Windows codecs and works on Linux/macOS.
+    /// </summary>
+    private static byte[] ResampleSampleProviderToPcm16(ISampleProvider source, int targetSampleRateHz)
+    {
+        ISampleProvider sampleProvider = source;
+        if (sampleProvider.WaveFormat.Channels != 1)
+        {
+            sampleProvider = new StereoToMonoSampleProvider(sampleProvider);
+        }
+        if (sampleProvider.WaveFormat.SampleRate != targetSampleRateHz)
+        {
+            sampleProvider = new WdlResamplingSampleProvider(sampleProvider, targetSampleRateHz);
+        }
+
+        var pcm16Provider = new SampleToWaveProvider16(sampleProvider);
+        using var outStream = new MemoryStream();
+        byte[] buffer = new byte[4096];
+        int bytesRead;
+        while ((bytesRead = pcm16Provider.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            outStream.Write(buffer, 0, bytesRead);
+        }
+        return outStream.ToArray();
+    }
+
     /// <summary>
     /// Normalizes 16-bit PCM audio to a specified maximum amplitude to prevent clipping.
     /// </summary>
@@ -22,6 +51,12 @@ public static class AudioAlgos
 
         short[] samples = new short[pcmAudio.Length / 2];
         Buffer.BlockCopy(pcmAudio, 0, samples, 0, pcmAudio.Length);
+
+        if (samples.Length == 0)
+        {
+            Log.Debug("No normalization needed: PCM audio is empty");
+            return pcmAudio;
+        }
 
         float maxSample = samples.Max(s => Math.Abs((float)s));
         if (maxSample == 0)
@@ -66,19 +101,8 @@ public static class AudioAlgos
 
         using var inputStream = new MemoryStream(inputPcm);
         using var rawSource = new RawSourceWaveStream(inputStream, new WaveFormat(inputSampleRate, 16, 1));
-        var outFormat = new WaveFormat(outputSampleRate, 16, 1);
 
-        using var conversionStream = new WaveFormatConversionStream(outFormat, rawSource);
-        using var outputStream = new MemoryStream();
-        byte[] buffer = new byte[4096];
-        int bytesRead;
-
-        while ((bytesRead = conversionStream.Read(buffer, 0, buffer.Length)) > 0)
-        {
-            outputStream.Write(buffer, 0, bytesRead);
-        }
-
-        byte[] resampled = outputStream.ToArray();
+        byte[] resampled = ResampleSampleProviderToPcm16(rawSource.ToSampleProvider(), outputSampleRate);
         Log.Debug($"Resampled audio from {inputSampleRate}Hz to {outputSampleRate}Hz: input {inputPcm.Length} bytes, output {resampled.Length} bytes");
 
         // Ensure output is even-length and padded to expected size
@@ -132,23 +156,7 @@ public static class AudioAlgos
             using var wavStream = new MemoryStream(wavAudio);
             using var reader = new WaveFileReader(wavStream);
 
-            var inputFormat = reader.WaveFormat;
-            var targetFormat = new WaveFormat(targetSampleRateHz, 16, 1);
-
-            using var resampler = new MediaFoundationResampler(reader, targetFormat)
-            {
-                ResamplerQuality = 60
-            };
-
-            using var outStream = new MemoryStream();
-            byte[] buffer = new byte[4096];
-            int bytesRead;
-            while ((bytesRead = resampler.Read(buffer, 0, buffer.Length)) > 0)
-            {
-                outStream.Write(buffer, 0, bytesRead);
-            }
-
-            byte[] rawPcm = outStream.ToArray();
+            byte[] rawPcm = ResampleSampleProviderToPcm16(reader.ToSampleProvider(), targetSampleRateHz);
             Log.Debug($"Converted WAV to PCM: {rawPcm.Length} bytes, {targetSampleRateHz} Hz, 16-bit mono");
             return rawPcm;
         }
