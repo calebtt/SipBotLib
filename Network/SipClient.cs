@@ -18,6 +18,7 @@ public class SipClient : IDisposable
     private const int MaxReconnectionAttempts = 5;
     private const int ReconnectionDelayMs = 2000;
     private const int HealthCheckIntervalMs = 30000; // 30 seconds
+    private const int BlindTransferTimeoutSeconds = 10;
 
     private readonly string _sipUsername;
     private readonly string _sipPassword;
@@ -57,6 +58,11 @@ public class SipClient : IDisposable
     public event Action<SipClient, Exception>? ErrorOccurred;
     public event Action<SipClient>? RegistrationStatusChanged;
     public event Action<SipClient, TimeSpan>? CallDurationUpdated;
+
+    // Transfer events
+    public event Action<SipClient, string>? TransferInitiated;
+    public event Action<SipClient>? TransferSucceeded;
+    public event Action<SipClient, string>? TransferFailed;
 
     // Properties
     public bool IsRegistered => _isRegistered;
@@ -314,6 +320,94 @@ public class SipClient : IDisposable
             ErrorOccurred?.Invoke(this, ex);
         }
     }
+
+    /// <summary>
+    /// Performs a blind transfer to a full SIP URI (e.g., "sip:100@pbx.example.com").
+    /// The original call leg is hung up on success.
+    /// </summary>
+    /// <param name="sipUri">The target SIP URI.</param>
+    /// <param name="timeout">Optional timeout for the transfer (default 10s).</param>
+    /// <param name="cancellationToken">Optional cancellation token.</param>
+    /// <returns>True if transfer succeeded, false otherwise.</returns>
+    public async Task<bool> BlindTransferAsync(
+        string sipUri,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_isDisposed)
+        {
+            throw new ObjectDisposedException(nameof(SipClient));
+        }
+
+        if (!IsCallActive)
+        {
+            var msg = "Cannot transfer: No active call.";
+            StatusMessage?.Invoke(this, msg);
+            TransferFailed?.Invoke(this, msg);
+            Log.Warning(msg);
+            return false;
+        }
+
+        try
+        {
+            if (!SIPURI.TryParse(sipUri, out var destination))
+            {
+                var msg = $"Invalid SIP URI: {sipUri}";
+                StatusMessage?.Invoke(this, msg);
+                TransferFailed?.Invoke(this, msg);
+                Log.Warning(msg);
+                return false;
+            }
+
+            var transferTimeout = timeout ?? TimeSpan.FromSeconds(BlindTransferTimeoutSeconds);
+            TransferInitiated?.Invoke(this, sipUri);
+            StatusMessage?.Invoke(this, $"Initiating blind transfer to {sipUri}...");
+            Log.Information($"Blind transfer initiated to {sipUri}");
+
+            var result = await _userAgent.BlindTransfer(destination, transferTimeout, cancellationToken);
+
+            if (result)
+            {
+                TransferSucceeded?.Invoke(this);
+                StatusMessage?.Invoke(this, $"Blind transfer to {sipUri} succeeded.");
+                Log.Information($"Blind transfer to {sipUri} succeeded");
+            }
+            else
+            {
+                var msg = $"Blind transfer to {sipUri} failed (timeout or rejection).";
+                TransferFailed?.Invoke(this, msg);
+                StatusMessage?.Invoke(this, msg);
+                Log.Warning(msg);
+            }
+
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            var msg = "Blind transfer cancelled.";
+            TransferFailed?.Invoke(this, msg);
+            Log.Warning(msg);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            var msg = $"Exception during blind transfer to {sipUri}: {ex.Message}";
+            StatusMessage?.Invoke(this, msg);
+            TransferFailed?.Invoke(this, msg);
+            ErrorOccurred?.Invoke(this, ex);
+            Log.Error(ex, msg);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Performs a blind transfer to an internal extension (e.g., "100").
+    /// Constructs URI as sip:{extension}@{_sipServer}.
+    /// </summary>
+    /// <param name="extension">The target extension.</param>
+    /// <param name="timeout">Optional timeout for the transfer (default 10s).</param>
+    public Task<bool> BlindTransferToExtensionAsync(string extension, TimeSpan? timeout = null) =>
+        BlindTransferAsync($"sip:{extension}@{_sipServer}", timeout ?? TimeSpan.FromSeconds(BlindTransferTimeoutSeconds));
 
     public void Shutdown()
     {

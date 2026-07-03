@@ -1,11 +1,13 @@
-﻿using Serilog;
-using SipBot;
+using Serilog;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading.Tasks;
 
+namespace SipBot;
+
 /// <summary>
 /// Built for paced sending of 8kHz 16bit mono PCMU encoded audio.
+/// Supports temporary audio filtering via ApplyFilter (manual clear via ClearFilter).
 /// </summary>
 public class RtpPacedSender
 {
@@ -19,14 +21,27 @@ public class RtpPacedSender
 
     private Action<uint, byte[]>? _sendAction;
 
-    public Action<uint, byte[]>? SendAction 
+    // Filter support: volatile for safe reads in the hot send loop.
+    private volatile Func<byte[], byte[]>? _currentFilter;
+
+    // Tracks whether real (non-silence) audio is currently queued/being sent, so SendingComplete
+    // can fire exactly once the last real frame has actually gone out.
+    private volatile bool _hasAudioPending = false;
+
+    /// <summary>Raised once the last queued real (non-silence) frame has been sent.</summary>
+    public event Action? SendingComplete;
+
+    public Action<uint, byte[]>? SendAction
     {
-        get {  return _sendAction; }
-        set 
-        {
-            _sendAction = value;
-        }
+        get => _sendAction;
+        set => _sendAction = value;
     }
+
+    /// <summary>
+    /// Gets a value indicating whether real audio frames (e.g., from TTS) are queued to send.
+    /// False if only silence is being sent.
+    /// </summary>
+    public bool IsPlaying => !_queue.IsEmpty;
 
     public RtpPacedSender()
     {
@@ -42,33 +57,44 @@ public class RtpPacedSender
 
         _cts?.Dispose();
         _cts = new CancellationTokenSource();
-        _senderTask = Task.Run(async () => { await RunAsync(_cts.Token); });
+        _senderTask = Task.Run(() => RunAsync(_cts.Token), _cts.Token);
     }
 
     public async Task Stop()
     {
-        if (_cts != null)
+        if (_cts == null) return;
+
+        _cts.Cancel();
+
+        // Due to a potential bug with the ConcurrentQueue, we will avoid clearing an empty CQ.
+        if (!_queue.IsEmpty)
         {
-            _cts.Cancel();
-            // Due to a potential bug with the ConcurrentQueue, we will avoid clearing an empty CQ.
             _queue.Enqueue(_silenceFrame);
-            _queue.Clear(); // Flush the queue to remove all pending frames
-
-            if (_senderTask != null)
-            {
-                try
-                {
-                    await _senderTask;
-                }
-                catch (TaskCanceledException)
-                {
-                }
-
-                _senderTask = null;
-            }
-
-            SendAction = null;
         }
+        while (_queue.TryDequeue(out _)) { }
+
+        if (_hasAudioPending)
+        {
+            Volatile.Write(ref _hasAudioPending, false);
+            SendingComplete?.Invoke();
+        }
+
+        if (_senderTask != null)
+        {
+            try
+            {
+                await _senderTask;
+            }
+            catch (TaskCanceledException)
+            {
+            }
+            _senderTask = null;
+        }
+
+        _sendAction = null;
+        ClearFilter();
+        _cts.Dispose();
+        _cts = null;
     }
 
     public void ResetBuffer()
@@ -79,10 +105,43 @@ public class RtpPacedSender
             return;
         }
 
+        if (_hasAudioPending)
+        {
+            Volatile.Write(ref _hasAudioPending, false);
+            SendingComplete?.Invoke();
+        }
+
         // Enqueue a silence frame to avoid potential ConcurrentQueue empty clear bug
-        _queue.Enqueue(_silenceFrame);
-        _queue.Clear();
+        if (!_queue.IsEmpty)
+        {
+            _queue.Enqueue(_silenceFrame);
+        }
+        while (_queue.TryDequeue(out _)) { }
+
         Log.Information($"[{nameof(RtpPacedSender)}] Buffer reset, queue cleared.");
+    }
+
+    /// <summary>
+    /// Applies a filter to outgoing audio frames until ClearFilter() is called.
+    /// Replaces any existing filter.
+    /// </summary>
+    /// <param name="filter">The filter function to apply (input: 160-byte frame; output: transformed frame).</param>
+    public void ApplyFilter(Func<byte[], byte[]> filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+
+        _currentFilter = filter;
+
+        Log.Information($"[{nameof(RtpPacedSender)}] Applied audio filter (clear manually via ClearFilter).");
+    }
+
+    /// <summary>
+    /// Immediately clears any active filter.
+    /// </summary>
+    public void ClearFilter()
+    {
+        _currentFilter = null;
+        Log.Debug($"[{nameof(RtpPacedSender)}] Audio filter cleared.");
     }
 
     private async Task RunAsync(CancellationToken token)
@@ -93,13 +152,42 @@ public class RtpPacedSender
 
         while (!token.IsCancellationRequested)
         {
-            if (SendAction != null)
+            if (_sendAction != null)
             {
-                byte[] frameToSend = _queue.TryDequeue(out var frame) ? frame : _silenceFrame;
-                if(SendAction is not null)
+                if (!_queue.TryDequeue(out var frame))
                 {
-                    SendAction(_twentyMsByteCount, frameToSend);
+                    frame = _silenceFrame;
                 }
+
+                var frameToSend = frame;
+
+                var filter = _currentFilter;
+                if (filter != null)
+                {
+                    try
+                    {
+                        frameToSend = filter(frameToSend);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, $"[{nameof(RtpPacedSender)}] Error applying audio filter; sending unfiltered frame.");
+                    }
+                }
+
+                _sendAction(_twentyMsByteCount, frameToSend);
+
+                // Fire SendingComplete once the last real (non-silence) frame has actually gone out.
+                if (_hasAudioPending)
+                {
+                    var isSilence = frameToSend.AsSpan().SequenceEqual(_silenceFrame.AsSpan());
+                    if (!isSilence && _queue.IsEmpty)
+                    {
+                        Volatile.Write(ref _hasAudioPending, false);
+                        SendingComplete?.Invoke();
+                        Log.Debug($"[{nameof(RtpPacedSender)}] Sending complete: all real audio frames sent.");
+                    }
+                }
+
                 expectedElapsedMs += _frameDurationMs;
             }
 
@@ -119,14 +207,18 @@ public class RtpPacedSender
 
     public void Enqueue(byte[] pcmuFrame)
     {
-        if (pcmuFrame?.Length == _twentyMsByteCount)
-        {
-            _queue.Enqueue(pcmuFrame);
-        }
-        else
+        if (pcmuFrame == null || pcmuFrame.Length != _twentyMsByteCount)
         {
             Log.Warning($"PCMU frame enqueued to RTP sender is not {_twentyMsByteCount} bytes.");
+            return;
         }
-    }
 
+        var isSilence = pcmuFrame.AsSpan().SequenceEqual(_silenceFrame.AsSpan());
+        if (!isSilence)
+        {
+            Volatile.Write(ref _hasAudioPending, true);
+        }
+
+        _queue.Enqueue(pcmuFrame);
+    }
 }
