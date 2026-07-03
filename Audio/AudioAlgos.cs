@@ -281,4 +281,195 @@ public static class AudioAlgos
             return Array.Empty<byte>();
         }
     }
+
+    /// <summary>
+    /// Reads a WAV file and converts it to 8kHz PCMU bytes.
+    /// </summary>
+    public static byte[] ReadWelcomeWavBytesAsPcmu(string filePath)
+    {
+        try
+        {
+            if (!File.Exists(filePath))
+            {
+                Log.Warning($"Welcome WAV file not found: {filePath}");
+                return Array.Empty<byte>();
+            }
+
+            using var wavStream = new FileStream(filePath, FileMode.Open, FileAccess.Read);
+            using var reader = new WaveFileReader(wavStream);
+            byte[] pcm8kHz = ResampleSampleProviderToPcm16(reader.ToSampleProvider(), 8000);
+
+            // Encode to PCMU
+            if (pcm8kHz.Length % 2 != 0)
+            {
+                Log.Warning($"PCM samples length {pcm8kHz.Length} is not even, trimming last byte.");
+                Array.Resize(ref pcm8kHz, pcm8kHz.Length - 1);
+            }
+
+            int sampleCount = pcm8kHz.Length / 2;
+            byte[] pcmu = new byte[sampleCount];
+
+            for (int i = 0; i < sampleCount; i++)
+            {
+                short sample = (short)(pcm8kHz[i * 2] | (pcm8kHz[i * 2 + 1] << 8));
+                pcmu[i] = MuLawEncoder.LinearToMuLawSample(sample);
+            }
+
+            Log.Debug($"Converted WAV to PCMU: {pcmu.Length} bytes");
+            return pcmu;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, $"Failed to read and convert welcome WAV file: {filePath}");
+            return Array.Empty<byte>();
+        }
+    }
+
+    /// <summary>
+    /// Reads a WAV file and converts it to 16kHz PCM bytes for STT processing.
+    /// </summary>
+    public static byte[] ReadWelcomeWavBytesAsPcm16kHz(string filePath)
+    {
+        try
+        {
+            if (!File.Exists(filePath))
+            {
+                Log.Warning($"Welcome WAV file not found: {filePath}");
+                return Array.Empty<byte>();
+            }
+
+            using var wavStream = new FileStream(filePath, FileMode.Open, FileAccess.Read);
+            using var reader = new WaveFileReader(wavStream);
+
+            // Resample to 16kHz mono 16-bit PCM
+            byte[] pcm16kHz = ResampleSampleProviderToPcm16(reader.ToSampleProvider(), 16000);
+            Log.Debug($"Converted WAV to 16kHz PCM: {pcm16kHz.Length} bytes");
+            return pcm16kHz;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, $"Failed to read and convert welcome WAV file to 16kHz PCM: {filePath}");
+            return Array.Empty<byte>();
+        }
+    }
+
+    /// <summary>
+    /// Processes a PCMU chunk to halve its volume by decoding to linear PCM, scaling, and re-encoding.
+    /// The operation is purely per-sample: it decodes each mu-law (PCMU) byte to a linear PCM value,
+    /// applies a scalar multiplier to adjust amplitude, clamps if needed, and re-encodes to mu-law—without
+    /// any dependency on timing, duration, or frequency content. This holds regardless of whether the audio
+    /// is at 8 kHz (standard for G.711) or another rate, as long as the input is a valid sequence of mu-law samples.
+    /// </summary>
+    public static byte[] AdjustPcmuVolume(byte[] pcmuInput, float scaleFactor = 0.5f)
+    {
+        int sampleCount = pcmuInput.Length;
+        byte[] output = new byte[sampleCount];
+
+        for (int i = 0; i < sampleCount; i++)
+        {
+            // Decode mu-law sample to 16-bit linear PCM
+            short linear = MuLawDecoder.MuLawToLinearSample(pcmuInput[i]);
+            // Scale by scaleFactor
+            int scaled = (int)(linear * scaleFactor);
+            // Clamp to 16-bit range if necessary (though scaling should not overflow)
+            if (scaled > short.MaxValue) scaled = short.MaxValue;
+            if (scaled < short.MinValue) scaled = short.MinValue;
+            // Re-encode to mu-law
+            output[i] = MuLawEncoder.LinearToMuLawSample((short)scaled);
+        }
+        return output;
+    }
+
+    /// <summary>
+    /// Converts 16-bit PCM audio (e.g., at 16kHz) to PCMU (G.711 μ-law) encoded audio at the specified output rate (default 8kHz for telephony).
+    /// </summary>
+    /// <param name="pcmAudio">16-bit mono PCM byte array (e.g., 16kHz)</param>
+    /// <param name="inputSampleRate">Input sample rate (e.g., 16000)</param>
+    /// <param name="outputSampleRate">Output sample rate for PCMU (default 8000)</param>
+    /// <returns>PCMU-encoded byte array at outputSampleRate</returns>
+    public static byte[] ConvertPcmToPcmu(byte[] pcmAudio, int inputSampleRate, int outputSampleRate = 8000)
+    {
+        try
+        {
+            // Step 1: Ensure even length
+            if (pcmAudio.Length % 2 != 0)
+            {
+                Log.Warning($"Invalid input PCM length: {pcmAudio.Length} bytes (must be even for 16-bit), padding with 1 byte");
+                byte[] paddedInput = new byte[pcmAudio.Length + 1];
+                Array.Copy(pcmAudio, paddedInput, pcmAudio.Length);
+                pcmAudio = paddedInput;
+            }
+
+            // Step 2: Resample to outputSampleRate if needed
+            byte[] resampledPcm;
+            if (inputSampleRate == outputSampleRate)
+            {
+                resampledPcm = pcmAudio;
+            }
+            else
+            {
+                resampledPcm = ResamplePcmWithNAudio(pcmAudio, inputSampleRate, outputSampleRate);
+            }
+
+            // Step 3: Encode 16-bit PCM samples to μ-law bytes
+            int sampleCount = resampledPcm.Length / 2; // 16-bit samples
+            byte[] pcmuOutput = new byte[sampleCount]; // 1 byte per μ-law sample
+
+            for (int i = 0; i < sampleCount; i++)
+            {
+                // Read little-endian 16-bit sample
+                short linearSample = (short)((resampledPcm[i * 2 + 1] << 8) | resampledPcm[i * 2]);
+                // Encode to μ-law
+                pcmuOutput[i] = MuLawEncoder.LinearToMuLawSample(linearSample);
+            }
+
+            return pcmuOutput;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Failed to convert PCM to PCMU.");
+            return Array.Empty<byte>();
+        }
+    }
+
+    /// <summary>
+    /// Appends the specified data to the original buffer, creating a new combined buffer.
+    /// </summary>
+    /// <param name="originalBuffer">The original byte array to which data will be appended.</param>
+    /// <param name="dataToAppend">The byte array to append to the original buffer.</param>
+    /// <returns>A new byte array containing the original buffer followed by the appended data.</returns>
+    /// <exception cref="ArgumentNullException">Thrown if <paramref name="originalBuffer"/> or <paramref name="dataToAppend"/> is null.</exception>
+    public static byte[] AppendBuffer(byte[] originalBuffer, byte[] dataToAppend)
+    {
+        ArgumentNullException.ThrowIfNull(originalBuffer);
+        ArgumentNullException.ThrowIfNull(dataToAppend);
+
+        byte[] extendedAudio = new byte[originalBuffer.Length + dataToAppend.Length];
+        Buffer.BlockCopy(originalBuffer, 0, extendedAudio, 0, originalBuffer.Length);
+        Buffer.BlockCopy(dataToAppend, 0, extendedAudio, originalBuffer.Length, dataToAppend.Length);
+        return extendedAudio;
+    }
+
+    /// <summary>
+    /// Generates mu-law silence audio for the specified duration in seconds.
+    /// </summary>
+    public static byte[] GeneratePcmuSilence(int durationSeconds, int sampleRate = 8000)
+    {
+        const byte silenceSample = 0xFF; // Mu-law silence
+        int byteCount = sampleRate * durationSeconds;
+        byte[] silence = new byte[byteCount];
+        Array.Fill(silence, silenceSample);
+        return silence;
+    }
+
+    /// <summary>
+    /// Generates PCM 16kHz silence audio for the specified duration in seconds.
+    /// </summary>
+    public static byte[] GeneratePcm16kHzSilence(int durationSeconds, int sampleRate = 16000)
+    {
+        const int bytesPerSample = 2; // 16-bit
+        int byteCount = sampleRate * durationSeconds * bytesPerSample;
+        byte[] silence = new byte[byteCount]; // Zero-initialized for silence
+        return silence;
+    }
 }
