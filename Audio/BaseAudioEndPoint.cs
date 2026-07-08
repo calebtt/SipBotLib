@@ -221,17 +221,29 @@ public abstract class BaseAudioEndPoint : IAudioSource, IAudioSink
     {
         _isStarted = true;
         _isMediaSessionReady = true;
-        _rtpAudioChannel = Channel.CreateBounded<(byte[] Pcm, int SampleRateHz)>(new BoundedChannelOptions(50)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleReader = true,
-            SingleWriter = false
-        });
-        _rtpProcessingTask = Task.Run(() => ProcessAudioChannelAsync(_rtpAudioChannel.Reader, _processAudioCancellationSource.Token));
 
         // VoIPMediaSession invokes StartAudio() via BOTH StartAudioSink() and StartAudioSource()
-        // (this object implements both interfaces), so guard against starting the pacer twice --
-        // RtpPacedSender.Start() throws if already running.
+        // (this object implements both interfaces). Guard channel/worker creation the same way as
+        // the keep-alive pacer -- a second call would otherwise orphan the first channel and leak
+        // a second background worker on the abandoned reader.
+        if (_rtpAudioChannel == null)
+        {
+            if (_processAudioCancellationSource.IsCancellationRequested)
+            {
+                _processAudioCancellationSource.Dispose();
+                _processAudioCancellationSource = new CancellationTokenSource();
+            }
+
+            _rtpAudioChannel = Channel.CreateBounded<(byte[] Pcm, int SampleRateHz)>(new BoundedChannelOptions(50)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+            _rtpProcessingTask = Task.Run(() => ProcessAudioChannelAsync(_rtpAudioChannel.Reader, _processAudioCancellationSource.Token));
+        }
+
+        // Guard against starting the pacer twice -- RtpPacedSender.Start() throws if already running.
         if (_enableContinuousKeepAlive && !_keepAliveSenderStarted)
         {
             _keepAliveSenderStarted = true;
@@ -278,8 +290,29 @@ public abstract class BaseAudioEndPoint : IAudioSource, IAudioSink
         }
         else
         {
-            ExternalAudioSourceEncodedSample((uint)(pcmSampleRateHz / 50), encoded); // 50 frames/sec == 20ms/frame
+            // durationRtpUnits must use the negotiated RTP clock (RtpClockRate), not the input PCM
+            // sample rate and not ClockRate. G.722 is the classic trap: ClockRate is 16000 but the
+            // RTP/SDP clock is still 8000, so 20ms is 160 timestamp units -- using ClockRate or the
+            // pre-resample input rate would advance timestamps ~2x too fast and desync outbound audio.
+            ExternalAudioSourceEncodedSample(RtpDurationForPcmSamples(samples.Length), encoded);
         }
+    }
+
+    /// <summary>
+    /// Converts a PCM sample count (at the negotiated <see cref="AudioFormat.ClockRate"/>) into
+    /// RTP timestamp units using <see cref="AudioFormat.RtpClockRate"/>.
+    /// </summary>
+    private uint RtpDurationForPcmSamples(int pcmSampleCount)
+    {
+        int clockRate = _negotiatedSendFormat.ClockRate;
+        int rtpClockRate = _negotiatedSendFormat.RtpClockRate > 0
+            ? _negotiatedSendFormat.RtpClockRate
+            : clockRate;
+
+        if (clockRate <= 0 || pcmSampleCount <= 0)
+            return 0;
+
+        return (uint)((long)pcmSampleCount * rtpClockRate / clockRate);
     }
     public Task StartAudioSink() => StartAudio();
     public Task StartAudioSource() => StartAudio();
@@ -299,7 +332,36 @@ public abstract class BaseAudioEndPoint : IAudioSource, IAudioSink
     {
         _isStarted = false;
         _isMediaSessionReady = false;
-        _rtpAudioChannel?.Writer.TryComplete();
+
+        // Null-out under the double-call pattern (CloseAudioSink + CloseAudioSource) so only the
+        // first invocation tears down the channel/worker; the second is a no-op for that path.
+        var channel = _rtpAudioChannel;
+        if (channel != null)
+        {
+            _rtpAudioChannel = null;
+            channel.Writer.TryComplete();
+
+            try
+            {
+                _processAudioCancellationSource.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+
+            if (_rtpProcessingTask != null)
+            {
+                try
+                {
+                    await _rtpProcessingTask;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                _rtpProcessingTask = null;
+            }
+        }
+
         if (_keepAliveSenderStarted)
         {
             _keepAliveSenderStarted = false;
