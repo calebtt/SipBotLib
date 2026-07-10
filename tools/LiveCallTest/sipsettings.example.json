@@ -1,0 +1,13 @@
+{
+  "SipSettings": {
+    "configs": [
+      {
+        "server": "pbx.example.com",
+        "port": 5060,
+        "username": "101",
+        "password": "CHANGE_ME",
+        "fromname": "SipBot Test"
+      }
+    ]
+  }
+}

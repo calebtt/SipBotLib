@@ -58,6 +58,8 @@ public class SipClient : IDisposable
     public event Action<SipClient, Exception>? ErrorOccurred;
     public event Action<SipClient>? RegistrationStatusChanged;
     public event Action<SipClient, TimeSpan>? CallDurationUpdated;
+    /// <summary>Raised when an INVITE arrives. Host should call <see cref="Accept"/> then <see cref="Answer"/>.</summary>
+    public event Action<SipClient, SIPRequest>? IncomingCall;
 
     // Transfer events
     public event Action<SipClient, string>? TransferInitiated;
@@ -109,7 +111,58 @@ public class SipClient : IDisposable
             _sipTransport.SIPResponseOutTraceEvent += (localSIPEndPoint, endPoint, response) =>
                 Log.Debug($"SIP Response Sent: {response.Status} to {endPoint}");
 
+            // STUN gives us the public IP, but nothing consumes it unless we also set ContactHost.
+            // Without that, REGISTER Contact stays on the private LAN address (e.g. 192.168.x.x).
+            // Many PBXs (VitalPBX/Asterisk) then store that Contact, fail qualify/OPTIONS against
+            // it, and treat the AOR as unreachable — callers hear busy and we never see an INVITE.
+            // RTP-side NAT fixes (AcceptRtpFromAny + keep-alive) only help after a call is up.
             StunHelper.SetupStun();
+            if (!string.IsNullOrWhiteSpace(StunHelper.PublicIPAddress))
+            {
+                _sipTransport.ContactHost = StunHelper.PublicIPAddress;
+                Log.Information(
+                    $"SIP ContactHost set to STUN public IP {StunHelper.PublicIPAddress} for NAT traversal");
+            }
+            else
+            {
+                Log.Warning(
+                    "STUN public IP unresolved; REGISTER Contact will use the local bind address " +
+                    "(inbound calls may fail behind NAT)");
+            }
+
+            // SIPSorcery's default REGISTER Contact is "sip:host:port" with no user part. VitalPBX
+            // is happier with "sip:ext@host:port" (matches the AOR). Customise after ContactHost
+            // so we own the final URI; return the header to replace.
+            _sipTransport.CustomiseRequestHeader = (localEP, remoteEP, req) =>
+            {
+                if (req.Method != SIPMethodsEnum.REGISTER)
+                    return null!;
+
+                string host = !string.IsNullOrWhiteSpace(StunHelper.PublicIPAddress)
+                    ? StunHelper.PublicIPAddress
+                    : localEP.Address.ToString();
+                int port = localEP.Port > 0 ? localEP.Port : req.Header.Contact?.FirstOrDefault()?.ContactURI?.ToSIPEndPoint()?.Port ?? 5060;
+                // Prefer the listen port from the contact the stack already built, if present.
+                var existing = req.Header.Contact?.FirstOrDefault()?.ContactURI;
+                if (existing != null && existing.ToSIPEndPoint() != null)
+                    port = existing.ToSIPEndPoint()!.Port;
+
+                var contactUri = new SIPURI(
+                    _sipUsername,
+                    $"{host}:{port}",
+                    null,
+                    SIPSchemesEnum.sip,
+                    SIPProtocolsEnum.udp);
+                req.Header.Contact = new List<SIPContactHeader> { new SIPContactHeader(null, contactUri) };
+                return req.Header;
+            };
+
+            // Asterisk/VitalPBX "qualify" probes the Contact with OPTIONS. SIPUserAgent does not
+            // auto-answer OPTIONS; without a 200 the peer is marked unreachable and callers get
+            // busy even though REGISTER succeeded. Confirmed live: OPTIONS to this process on the
+            // LAN timed out with zero response before this handler existed.
+            _sipTransport.SIPTransportRequestReceived += OnTransportRequestReceived;
+
             IncrementMetric("transport_initialized");
         }
         catch (Exception ex)
@@ -117,6 +170,24 @@ public class SipClient : IDisposable
             Log.Error(ex, "Failed to initialize SIP transport");
             ErrorOccurred?.Invoke(this, ex);
             throw;
+        }
+    }
+
+    private Task OnTransportRequestReceived(SIPEndPoint localEP, SIPEndPoint remoteEP, SIPRequest req)
+    {
+        if (req.Method != SIPMethodsEnum.OPTIONS)
+            return Task.CompletedTask;
+
+        try
+        {
+            var optionsResponse = SIPResponse.GetResponse(req, SIPResponseStatusCodesEnum.Ok, null);
+            Log.Debug($"Answering OPTIONS from {remoteEP} with 200 OK");
+            return _sipTransport.SendResponseAsync(optionsResponse);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, $"Failed to answer OPTIONS from {remoteEP}");
+            return Task.CompletedTask;
         }
     }
 
@@ -542,6 +613,7 @@ public class SipClient : IDisposable
     {
         IncrementMetric("incoming_calls");
         Log.Information($"Incoming call from {sipRequest.Header.From}");
+        IncomingCall?.Invoke(this, sipRequest);
     }
 
     private void CallTrying(ISIPClientUserAgent uac, SIPResponse sipResponse)
