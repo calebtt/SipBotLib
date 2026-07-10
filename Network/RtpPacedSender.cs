@@ -24,9 +24,9 @@ public class RtpPacedSender
     // Filter support: volatile for safe reads in the hot send loop.
     private volatile Func<byte[], byte[]>? _currentFilter;
 
-    // Tracks whether real (non-silence) audio is currently queued/being sent, so SendingComplete
-    // can fire exactly once the last real frame has actually gone out.
-    private volatile bool _hasAudioPending = false;
+    // Count of enqueued real (non-silence) frames not yet sent. Drives IsPlaying and
+    // SendingComplete without inspecting post-filter bytes or scanning the queue.
+    private int _pendingRealFrameCount;
 
     /// <summary>Raised once the last queued real (non-silence) frame has been sent.</summary>
     public event Action? SendingComplete;
@@ -38,10 +38,10 @@ public class RtpPacedSender
     }
 
     /// <summary>
-    /// Gets a value indicating whether real audio frames (e.g., from TTS) are queued to send.
-    /// False if only silence is being sent.
+    /// True while at least one real (non-silence) frame is still queued or currently being sent.
+    /// Silence keep-alive frames and an empty queue both report false.
     /// </summary>
-    public bool IsPlaying => !_queue.IsEmpty;
+    public bool IsPlaying => Volatile.Read(ref _pendingRealFrameCount) > 0;
 
     public RtpPacedSender()
     {
@@ -73,11 +73,7 @@ public class RtpPacedSender
         }
         while (_queue.TryDequeue(out _)) { }
 
-        if (_hasAudioPending)
-        {
-            Volatile.Write(ref _hasAudioPending, false);
-            SendingComplete?.Invoke();
-        }
+        SignalSendingCompleteIfPending();
 
         if (_senderTask != null)
         {
@@ -105,11 +101,7 @@ public class RtpPacedSender
             return;
         }
 
-        if (_hasAudioPending)
-        {
-            Volatile.Write(ref _hasAudioPending, false);
-            SendingComplete?.Invoke();
-        }
+        SignalSendingCompleteIfPending();
 
         // Enqueue a silence frame to avoid potential ConcurrentQueue empty clear bug
         if (!_queue.IsEmpty)
@@ -154,12 +146,18 @@ public class RtpPacedSender
         {
             if (_sendAction != null)
             {
-                if (!_queue.TryDequeue(out var frame))
+                bool dequeuedFromQueue = _queue.TryDequeue(out var frame);
+                if (!dequeuedFromQueue)
                 {
                     frame = _silenceFrame;
                 }
 
-                var frameToSend = frame;
+                // Classify real vs silence on the pre-filter frame. Filters (e.g. volume ducking)
+                // must not change whether this frame counts toward IsPlaying / SendingComplete,
+                // and silence enqueued after real audio must not block completion forever.
+                bool wasRealAudio = dequeuedFromQueue && frame != null && !IsSilenceFrame(frame);
+
+                var frameToSend = frame!;
 
                 var filter = _currentFilter;
                 if (filter != null)
@@ -176,13 +174,11 @@ public class RtpPacedSender
 
                 _sendAction(_twentyMsByteCount, frameToSend);
 
-                // Fire SendingComplete once the last real (non-silence) frame has actually gone out.
-                if (_hasAudioPending)
+                if (wasRealAudio)
                 {
-                    var isSilence = frameToSend.AsSpan().SequenceEqual(_silenceFrame.AsSpan());
-                    if (!isSilence && _queue.IsEmpty)
+                    // Last real frame has actually gone out when the counter hits zero.
+                    if (Interlocked.Decrement(ref _pendingRealFrameCount) == 0)
                     {
-                        Volatile.Write(ref _hasAudioPending, false);
                         SendingComplete?.Invoke();
                         Log.Debug($"[{nameof(RtpPacedSender)}] Sending complete: all real audio frames sent.");
                     }
@@ -213,12 +209,27 @@ public class RtpPacedSender
             return;
         }
 
-        var isSilence = pcmuFrame.AsSpan().SequenceEqual(_silenceFrame.AsSpan());
-        if (!isSilence)
+        if (!IsSilenceFrame(pcmuFrame))
         {
-            Volatile.Write(ref _hasAudioPending, true);
+            Interlocked.Increment(ref _pendingRealFrameCount);
         }
 
         _queue.Enqueue(pcmuFrame);
+    }
+
+    private bool IsSilenceFrame(byte[] frame) =>
+        frame.AsSpan().SequenceEqual(_silenceFrame.AsSpan());
+
+    /// <summary>
+    /// Drops any outstanding real-frame count (queue is about to be wiped) and fires
+    /// <see cref="SendingComplete"/> if something was still pending.
+    /// </summary>
+    private void SignalSendingCompleteIfPending()
+    {
+        int pending = Interlocked.Exchange(ref _pendingRealFrameCount, 0);
+        if (pending > 0)
+        {
+            SendingComplete?.Invoke();
+        }
     }
 }
