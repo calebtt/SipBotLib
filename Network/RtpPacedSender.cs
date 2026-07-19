@@ -203,12 +203,53 @@ public class RtpPacedSender
 
     public void Enqueue(byte[] pcmuFrame)
     {
-        if (pcmuFrame == null || pcmuFrame.Length != _twentyMsByteCount)
+        if (pcmuFrame == null || pcmuFrame.Length == 0)
+            return;
+
+        // Accept bulk PCMU and split into 20ms frames (160 bytes). Callers sometimes pass
+        // a whole Grok/OpenAI audio delta encoded at once.
+        if (pcmuFrame.Length != _twentyMsByteCount)
         {
-            Log.Warning($"PCMU frame enqueued to RTP sender is not {_twentyMsByteCount} bytes.");
+            if (pcmuFrame.Length % _twentyMsByteCount == 0)
+            {
+                for (int i = 0; i < pcmuFrame.Length; i += (int)_twentyMsByteCount)
+                {
+                    var slice = new byte[_twentyMsByteCount];
+                    Buffer.BlockCopy(pcmuFrame, i, slice, 0, (int)_twentyMsByteCount);
+                    EnqueueFrame(slice);
+                }
+                return;
+            }
+
+            // Partial trailing frame: pad with silence so we don't drop the last samples
+            if (pcmuFrame.Length < _twentyMsByteCount)
+            {
+                var padded = new byte[_twentyMsByteCount];
+                Buffer.BlockCopy(pcmuFrame, 0, padded, 0, pcmuFrame.Length);
+                for (int i = pcmuFrame.Length; i < padded.Length; i++)
+                    padded[i] = _silenceFrameByte;
+                EnqueueFrame(padded);
+                return;
+            }
+
+            Log.Warning(
+                "PCMU buffer length {Len} is not a multiple of {Frame}; dropping remainder after full frames.",
+                pcmuFrame.Length, _twentyMsByteCount);
+            int full = pcmuFrame.Length / (int)_twentyMsByteCount;
+            for (int i = 0; i < full; i++)
+            {
+                var slice = new byte[_twentyMsByteCount];
+                Buffer.BlockCopy(pcmuFrame, i * (int)_twentyMsByteCount, slice, 0, (int)_twentyMsByteCount);
+                EnqueueFrame(slice);
+            }
             return;
         }
 
+        EnqueueFrame(pcmuFrame);
+    }
+
+    private void EnqueueFrame(byte[] pcmuFrame)
+    {
         if (!IsSilenceFrame(pcmuFrame))
         {
             Interlocked.Increment(ref _pendingRealFrameCount);

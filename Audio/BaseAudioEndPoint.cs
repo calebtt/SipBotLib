@@ -257,14 +257,17 @@ public abstract class BaseAudioEndPoint : IAudioSource, IAudioSink
     }
 
     /// <summary>
-    /// Send one 20ms frame of raw 16-bit mono PCM outbound. Resamples to the negotiated format's
-    /// rate if pcmSampleRateHz doesn't already match it, then encodes with whichever codec was
-    /// actually negotiated (PCMU or, if wideband audio is enabled and the far end agreed, G.722)
-    /// before handing the encoded bytes to ExternalAudioSourceEncodedSample (paced via
-    /// RtpPacedSender if continuous keep-alive is enabled, otherwise sent immediately).
+    /// Send raw 16-bit mono PCM outbound (any length). Resamples to the negotiated format's
+    /// rate if needed, encodes, then either:
+    /// - keep-alive mode: splits into 20ms frames for <see cref="RtpPacedSender"/> (exactly 160
+    ///   bytes for PCMU — bulk Grok/OpenAI deltas must be sliced or they are dropped), or
+    /// - reactive mode: sends the encoded buffer immediately.
     /// </summary>
     protected void SendAudioFrame(byte[] pcm, int pcmSampleRateHz)
     {
+        if (pcm == null || pcm.Length < 2)
+            return;
+
         short[] samples = new short[pcm.Length / 2];
         Buffer.BlockCopy(pcm, 0, samples, 0, samples.Length * 2);
 
@@ -273,10 +276,40 @@ public abstract class BaseAudioEndPoint : IAudioSource, IAudioSink
             samples = PcmResampler.Resample(samples, pcmSampleRateHz, _negotiatedSendFormat.ClockRate);
         }
 
-        byte[] encoded;
+        // 20ms of samples at negotiated clock (PCMU 8k → 160 samples → 160 PCMU bytes)
+        int samplesPerFrame = Math.Max(1, _negotiatedSendFormat.ClockRate / 50);
+
+        if (_enableContinuousKeepAlive)
+        {
+            // Encode and enqueue in fixed 20ms slices — RtpPacedSender requires exact frame size.
+            int offset = 0;
+            while (offset < samples.Length)
+            {
+                var slice = new short[samplesPerFrame];
+                int n = Math.Min(samplesPerFrame, samples.Length - offset);
+                Array.Copy(samples, offset, slice, 0, n);
+                // shortfall stays zero (silence after pad)
+                try
+                {
+                    byte[] encoded = _audioEncoder.EncodeAudio(slice, _negotiatedSendFormat);
+                    _keepAlivePacedSender.Enqueue(encoded);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, $"[{GetType().Name}] Failed to encode 20ms {_negotiatedSendFormat.FormatName} frame.");
+                    return;
+                }
+                offset += samplesPerFrame;
+                if (n < samplesPerFrame)
+                    break;
+            }
+            return;
+        }
+
+        byte[] encodedAll;
         try
         {
-            encoded = _audioEncoder.EncodeAudio(samples, _negotiatedSendFormat);
+            encodedAll = _audioEncoder.EncodeAudio(samples, _negotiatedSendFormat);
         }
         catch (Exception ex)
         {
@@ -284,18 +317,11 @@ public abstract class BaseAudioEndPoint : IAudioSource, IAudioSink
             return;
         }
 
-        if (_enableContinuousKeepAlive)
-        {
-            _keepAlivePacedSender.Enqueue(encoded);
-        }
-        else
-        {
-            // durationRtpUnits must use the negotiated RTP clock (RtpClockRate), not the input PCM
-            // sample rate and not ClockRate. G.722 is the classic trap: ClockRate is 16000 but the
-            // RTP/SDP clock is still 8000, so 20ms is 160 timestamp units -- using ClockRate or the
-            // pre-resample input rate would advance timestamps ~2x too fast and desync outbound audio.
-            ExternalAudioSourceEncodedSample(RtpDurationForPcmSamples(samples.Length), encoded);
-        }
+        // durationRtpUnits must use the negotiated RTP clock (RtpClockRate), not the input PCM
+        // sample rate and not ClockRate. G.722 is the classic trap: ClockRate is 16000 but the
+        // RTP/SDP clock is still 8000, so 20ms is 160 timestamp units -- using ClockRate or the
+        // pre-resample input rate would advance timestamps ~2x too fast and desync outbound audio.
+        ExternalAudioSourceEncodedSample(RtpDurationForPcmSamples(samples.Length), encodedAll);
     }
 
     /// <summary>
