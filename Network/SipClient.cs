@@ -1,5 +1,6 @@
 ﻿using Serilog;
 using SIPSorcery.Media;
+using System.Net;
 using SIPSorcery.Net;
 using SIPSorcery.SIP;
 using SIPSorcery.SIP.App;
@@ -66,9 +67,21 @@ public class SipClient : IDisposable
     public event Action<SipClient>? TransferSucceeded;
     public event Action<SipClient, string>? TransferFailed;
 
+    /// <summary>RFC2833 / telephone-event digit (0-9, *, #, A-D). Raised once per complete tone.</summary>
+    public event Action<SipClient, char>? DtmfDigitReceived;
+
     // Properties
     public bool IsRegistered => _isRegistered;
     public bool IsCallActive => _userAgent?.IsCallActive ?? false;
+
+    private static bool IsLoopbackHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host)) return false;
+        var h = host.Trim();
+        if (h.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        if (h is "127.0.0.1" or "::1") return true;
+        return IPAddress.TryParse(h, out var ip) && IPAddress.IsLoopback(ip);
+    }
     public TimeSpan CurrentCallDuration => _callDurationTimer.IsRunning ? _callDurationTimer.Elapsed : TimeSpan.Zero;
     public DateTime LastSuccessfulRegistration => _lastSuccessfulRegistration;
     public IReadOnlyDictionary<string, long> Metrics => _metrics;
@@ -111,24 +124,43 @@ public class SipClient : IDisposable
             _sipTransport.SIPResponseOutTraceEvent += (localSIPEndPoint, endPoint, response) =>
                 Log.Debug($"SIP Response Sent: {response.Status} to {endPoint}");
 
-            // STUN gives us the public IP, but nothing consumes it unless we also set ContactHost.
-            // Without that, REGISTER Contact stays on the private LAN address (e.g. 192.168.x.x).
-            // Many PBXs (VitalPBX/Asterisk) then store that Contact, fail qualify/OPTIONS against
-            // it, and treat the AOR as unreachable — callers hear busy and we never see an INVITE.
-            // RTP-side NAT fixes (AcceptRtpFromAny + keep-alive) only help after a call is up.
-            StunHelper.SetupStun();
-            if (!string.IsNullOrWhiteSpace(StunHelper.PublicIPAddress))
+            // Contact host for REGISTER:
+            // - When PBX is loopback (same host as Asterisk), use 127.0.0.1 — STUN public IP
+            //   is wrong and IPv6 STUN results break SIP URI parsing without brackets.
+            // - Otherwise STUN public IPv4 for NAT traversal.
+            bool localPbx = IsLoopbackHost(_sipServer);
+            string? contactHost = null;
+            if (localPbx)
             {
-                _sipTransport.ContactHost = StunHelper.PublicIPAddress;
-                Log.Information(
-                    $"SIP ContactHost set to STUN public IP {StunHelper.PublicIPAddress} for NAT traversal");
+                contactHost = "127.0.0.1";
+                Log.Information("SIP ContactHost=127.0.0.1 (PBX server is loopback; skipping STUN)");
             }
             else
             {
-                Log.Warning(
-                    "STUN public IP unresolved; REGISTER Contact will use the local bind address " +
-                    "(inbound calls may fail behind NAT)");
+                StunHelper.SetupStun();
+                var stunIp = StunHelper.PublicIPAddress;
+                // Prefer IPv4 Contact; unbracketed IPv6 breaks SIPURI.ParseSIPURI.
+                if (!string.IsNullOrWhiteSpace(stunIp)
+                    && IPAddress.TryParse(stunIp, out var parsed)
+                    && parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                {
+                    contactHost = stunIp;
+                    Log.Information("SIP ContactHost set to STUN public IPv4 {Ip} for NAT traversal", stunIp);
+                }
+                else if (!string.IsNullOrWhiteSpace(stunIp))
+                {
+                    Log.Warning("STUN returned non-IPv4 {Ip}; leaving ContactHost unset", stunIp);
+                }
+                else
+                {
+                    Log.Warning(
+                        "STUN public IP unresolved; REGISTER Contact will use the local bind address " +
+                        "(inbound calls may fail behind NAT)");
+                }
             }
+
+            if (!string.IsNullOrWhiteSpace(contactHost))
+                _sipTransport.ContactHost = contactHost;
 
             // SIPSorcery's default REGISTER Contact is "sip:host:port" with no user part. VitalPBX
             // is happier with "sip:ext@host:port" (matches the AOR). Customise after ContactHost
@@ -138,9 +170,10 @@ public class SipClient : IDisposable
                 if (req.Method != SIPMethodsEnum.REGISTER)
                     return null!;
 
-                string host = !string.IsNullOrWhiteSpace(StunHelper.PublicIPAddress)
-                    ? StunHelper.PublicIPAddress
-                    : localEP.Address.ToString();
+                string host = contactHost
+                    ?? (localEP.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                        ? localEP.Address.ToString()
+                        : "127.0.0.1");
                 int port = localEP.Port > 0 ? localEP.Port : req.Header.Contact?.FirstOrDefault()?.ContactURI?.ToSIPEndPoint()?.Port ?? 5060;
                 // Prefer the listen port from the contact the stack already built, if present.
                 var existing = req.Header.Contact?.FirstOrDefault()?.ContactURI;
@@ -331,6 +364,8 @@ public class SipClient : IDisposable
             }
 
             var mediaSession = CreateMediaSession(CreateMediaEndPoints(audioSink, audioSource));
+            // DTMF (RFC2833 telephone-event) for keypad PIN collection
+            mediaSession.OnRtpEvent += HandleRtpEvent;
             lock (_lockObject)
             {
                 _mediaSession = mediaSession;
@@ -543,6 +578,39 @@ public class SipClient : IDisposable
         voipMediaSession.AcceptRtpFromAny = true;
         Log.Information($"[{GetType().Name}] Created with AudioSink={mediaEndPoints.AudioSink.GetType().Name}, AcceptRtpFromAny={voipMediaSession.AcceptRtpFromAny}");
         return voipMediaSession;
+    }
+
+    // RFC2833 DTMF: emit once per tone when EndOfEvent is true.
+    private void HandleRtpEvent(IPEndPoint remoteEP, RTPEvent rtpEvent, RTPHeader header)
+    {
+        try
+        {
+            if (!rtpEvent.EndOfEvent)
+                return;
+
+            // EventID 0-9 = digits, 10=*, 11=#, 12-15=A-D
+            int id = rtpEvent.EventID;
+            char? ch = id switch
+            {
+                >= 0 and <= 9 => (char)('0' + id),
+                10 => '*',
+                11 => '#',
+                12 => 'A',
+                13 => 'B',
+                14 => 'C',
+                15 => 'D',
+                _ => null
+            };
+            if (ch is char digit)
+            {
+                Log.Information("DTMF digit received: {Digit}", digit);
+                DtmfDigitReceived?.Invoke(this, digit);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Error handling RTP DTMF event");
+        }
     }
 
     // Event handlers
