@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>SipBotLib</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.1.2</Version>
     <Authors>Caleb Taylor</Authors>
     <Description>Headless SIP/PBX library for coding agents: register, answer, dial, transfer, DTMF, play, and record. No GUI softphone.</Description>
     <RepositoryUrl>https://github.com/calebtt/SipBotLib</RepositoryUrl>
