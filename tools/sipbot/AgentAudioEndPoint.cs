@@ -31,13 +31,42 @@ sealed class AgentAudioEndPoint : BaseAudioEndPoint
 
     public void PlayWav(string path)
     {
-        if (!File.Exists(path))
-            throw new FileNotFoundException("WAV file not found", path);
+        if (string.IsNullOrWhiteSpace(path))
+            throw new ArgumentException("play requires 'file' (a readable PCM or μ-law WAV). " + AudioCaps.PlayHelp);
 
-        byte[] wav = File.ReadAllBytes(path);
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException(
+                $"WAV file not found: {path}. {AudioCaps.PlayHelp}",
+                path);
+        }
+
+        byte[] wav;
+        try
+        {
+            wav = File.ReadAllBytes(path);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(AudioCaps.UnreadableWavMessage(path, ex.Message), ex);
+        }
+
+        try
+        {
+            using var ms = new MemoryStream(wav, writable: false);
+            using var reader = new WaveFileReader(ms);
+            _ = reader.WaveFormat.SampleRate;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(AudioCaps.UnreadableWavMessage(path, ex.Message), ex);
+        }
+
         byte[] pcm = AudioAlgos.ConvertWavToPcm(wav, 8000);
         if (pcm.Length == 0)
-            throw new InvalidOperationException($"Failed to decode WAV: {path}");
+            throw new InvalidOperationException(AudioCaps.UnreadableWavMessage(path, "decode produced no PCM."));
+
+        // 8 kHz PCM in; SendAudioFrame resamples again to the negotiated clock (8 or 16 kHz).
         PlayPcm(pcm, 8000);
     }
 

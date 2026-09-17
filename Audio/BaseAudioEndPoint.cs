@@ -208,6 +208,9 @@ public abstract class BaseAudioEndPoint : IAudioSource, IAudioSink
     /// SIPSorcery's own VoIPMediaSession comments, that isn't knowable until the first RTP packet
     /// actually arrives, which is why GotEncodedMediaFrame reads the format off each frame instead.)
     /// </summary>
+    /// <summary>Outbound codec chosen after SDP (PCMU 8 kHz until negotiation completes).</summary>
+    public AudioFormat NegotiatedSendFormat => _negotiatedSendFormat;
+
     public void SetAudioSourceFormat(AudioFormat audioFormat)
     {
         _negotiatedSendFormat = audioFormat;

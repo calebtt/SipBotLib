@@ -97,7 +97,8 @@ sealed class ServeHost : IDisposable
                 Jsonl.Event("registered", new()
                 {
                     ["user"] = c.Username,
-                    ["server"] = c.Server
+                    ["server"] = c.Server,
+                    ["audio"] = AudioCaps.Advertised(_options.PcmuOnly)
                 });
             }
             EmitStatus();
@@ -111,7 +112,10 @@ sealed class ServeHost : IDisposable
         client.CallAnswer += _ =>
         {
             _callStartedUtc = DateTime.UtcNow;
-            Jsonl.Event("answered");
+            Jsonl.Event("answered", new()
+            {
+                ["audio"] = AudioCaps.Negotiated(_endpoint.NegotiatedSendFormat)
+            });
         };
 
         client.CallEnded += _ =>
@@ -488,11 +492,19 @@ sealed class ServeHost : IDisposable
 
     private void EmitStatus() => Jsonl.Event("status", StatusFields());
 
-    private Dictionary<string, object?> StatusFields() => new()
+    private Dictionary<string, object?> StatusFields()
     {
-        ["registered"] = _client?.IsRegistered ?? false,
-        ["callActive"] = _client?.IsCallActive ?? false
-    };
+        bool callActive = _client?.IsCallActive ?? false;
+        return new()
+        {
+            ["registered"] = _client?.IsRegistered ?? false,
+            ["callActive"] = callActive,
+            ["audio"] = AudioCaps.ForStatus(
+                _options.PcmuOnly,
+                callActive,
+                callActive ? _endpoint.NegotiatedSendFormat : null)
+        };
+    }
 
     public void Dispose()
     {

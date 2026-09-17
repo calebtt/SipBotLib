@@ -70,16 +70,18 @@ Env-only is enough if `SIP_SERVER` and `SIP_USERNAME` are set. Never commit real
 ### Events
 
 ```json
-{"event":"registered","user":"101","server":"pbx.example.com"}
+{"event":"registered","user":"101","server":"pbx.example.com","audio":{"codecs":["PCMU","G722"],"playHint":"any PCM/μ-law WAV; source sample rate does not matter (resampled to the negotiated codec: PCMU 8 kHz default, G.722 16 kHz unless --pcmu-only)","pcmuOnly":false}}
 {"event":"invite","from":"…","callId":"…"}
-{"event":"answered"}
+{"event":"answered","audio":{"codec":"G722","clockRateHz":16000,"rtpClockRateHz":8000}}
 {"event":"dtmf","digit":"5"}
 {"event":"ended","durationSec":42}
 {"event":"error","message":"…"}
-{"event":"status","registered":true,"callActive":false}
+{"event":"status","registered":true,"callActive":false,"audio":{"codecs":["PCMU","G722"],"playHint":"…","pcmuOnly":false}}
 {"event":"dtmf_result","digits":"1234","timedOut":false}
 {"event":"recorded","file":"out.wav","seconds":30}
 ```
+
+**Audio:** `{"cmd":"play","file":"prompt.wav"}` accepts any readable PCM or μ-law WAV. Source sample rate does not matter. Outbound is resampled to the **negotiated** codec after SDP (`answered.audio`): PCMU 8 kHz by default, or G.722 16 kHz if the far end agrees (`--pcmu-only` disables G.722). Do not invent a play sample-rate flag. On a bad file, `error.message` says it is not a readable WAV and that rate is resampled.
 
 ### Commands
 
@@ -97,7 +99,7 @@ Env-only is enough if `SIP_SERVER` and `SIP_USERNAME` are set. Never commit real
 
 Transfer / dial targets: bare extension (`102`), `user@host`, or full `sip:` URI. Bare extensions become `sip:{ext}@{SIP_SERVER}`.
 
-Flags: `--auto-answer`, `--play FILE` (with auto-answer), `--settings PATH`, `--config N`, `--pcmu-only`, `--no-keepalive`.
+Flags: `--auto-answer`, `--play FILE` (with auto-answer), `--settings PATH`, `--config N`, `--pcmu-only`, `--no-keepalive`. `sipbot serve --help` states the play/resample rule.
 
 ## Minimal inbound flow
 
@@ -119,7 +121,7 @@ Does not publish to nuget.org from this repo by default.
 
 ## Known limits
 
-- Outbound audio is **PCMU (8 kHz)** unless G.722 is negotiated (`--pcmu-only` disables G.722).
+- Outbound RTP is **PCMU (8 kHz)** unless G.722 is negotiated (`answered.audio.clockRateHz` is 16000 then). `--pcmu-only` disables G.722. Play WAV is always resampled; do not match the file rate yourself.
 - No acoustic echo cancellation (AEC).
 - NAudio is referenced for **managed** WAV/PCM/μ-law (WDL resampler, `WaveFileReader`). MediaFoundation is not used; Linux agents do not need Windows codecs.
 - Single call at a time per `sipbot` process.
