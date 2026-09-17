@@ -4,3 +4,9 @@ sipsettings.json
 **/sipsettings.json
 tools/**/bin/
 tools/**/obj/
+tests/**/bin/
+tests/**/obj/
+dist/
+*.nupkg
+*.snupkg
+

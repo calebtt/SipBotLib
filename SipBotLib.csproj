@@ -4,7 +4,26 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <PackageId>SipBotLib</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Caleb Taylor</Authors>
+    <Description>Headless SIP/PBX library for coding agents: register, answer, dial, transfer, DTMF, play, and record. No GUI softphone.</Description>
+    <RepositoryUrl>https://github.com/calebtt/SipBotLib</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/calebtt/SipBotLib</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>sip;pbx;voip;sipsorcery;agent</PackageTags>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SipBotLib.Tests" />
+  </ItemGroup>
 
 
   <ItemGroup>
@@ -21,5 +40,7 @@
   <ItemGroup>
     <Compile Remove="tools/**" />
     <None Remove="tools/**" />
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
   </ItemGroup>
 </Project>

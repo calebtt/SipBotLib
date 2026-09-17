@@ -61,6 +61,12 @@ public class SipClient : IDisposable
     /// <summary>Raised when an INVITE arrives. Host should call <see cref="Accept"/> then <see cref="Answer"/>.</summary>
     public event Action<SipClient, SIPRequest>? IncomingCall;
 
+    /// <summary>
+    /// Raised when an RFC 4733 DTMF event completes on the remote RTP stream.
+    /// Arguments are the raw telephone-event code and duration.
+    /// </summary>
+    public event Action<SipClient, byte, int>? DtmfReceived;
+
     // Transfer events
     public event Action<SipClient, string>? TransferInitiated;
     public event Action<SipClient>? TransferSucceeded;
@@ -72,6 +78,8 @@ public class SipClient : IDisposable
     public TimeSpan CurrentCallDuration => _callDurationTimer.IsRunning ? _callDurationTimer.Elapsed : TimeSpan.Zero;
     public DateTime LastSuccessfulRegistration => _lastSuccessfulRegistration;
     public IReadOnlyDictionary<string, long> Metrics => _metrics;
+    public string Username => _sipUsername;
+    public string Server => _sipServer;
 
     public SipClient(
         SIPTransport sipTransport,
@@ -243,6 +251,7 @@ public class SipClient : IDisposable
         userAgent.OnCallHungup += CallFinished;
         userAgent.ServerCallCancelled += IncomingCallCancelled;
         userAgent.OnIncomingCall += OnIncomingCall;
+        userAgent.OnDtmfTone += OnDtmfTone;
         return userAgent;
     }
 
@@ -366,6 +375,80 @@ public class SipClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Places an outbound call. Destination may be a full SIP URI, <c>user@host</c>, or a bare
+    /// extension (normalized to <c>sip:{ext}@{server}</c>). Media is attached the same way as
+    /// <see cref="Answer"/>. Existing events (<see cref="CallAnswer"/>, <see cref="CallEnded"/>,
+    /// DTMF, status) are raised on the same path as inbound calls.
+    /// </summary>
+    public async Task<bool> CallAsync(
+        string destination,
+        IAudioSink audioSink,
+        IAudioSource audioSource,
+        int ringTimeoutSeconds = 60,
+        CancellationToken cancellationToken = default)
+    {
+        if (_isDisposed)
+            throw new ObjectDisposedException(nameof(SipClient));
+
+        if (IsCallActive)
+        {
+            var msg = "Cannot dial: a call is already active.";
+            StatusMessage?.Invoke(this, msg);
+            Log.Warning(msg);
+            return false;
+        }
+
+        ArgumentException.ThrowIfNullOrWhiteSpace(destination);
+        ArgumentNullException.ThrowIfNull(audioSink);
+        ArgumentNullException.ThrowIfNull(audioSource);
+
+        string uri = SipUriNormalizer.Normalize(destination, _sipServer);
+        try
+        {
+            var mediaSession = CreateMediaSession(CreateMediaEndPoints(audioSink, audioSource));
+            lock (_lockObject)
+            {
+                _mediaSession = mediaSession;
+            }
+
+            using var cancelReg = cancellationToken.Register(() =>
+            {
+                try { _userAgent.Cancel(); }
+                catch (Exception ex) { Log.Debug(ex, "Cancel during outbound dial"); }
+            });
+
+            StatusMessage?.Invoke(this, $"Dialing {uri}...");
+            Log.Information("Outbound call to {Uri}", uri);
+            IncrementMetric("outbound_call_attempts");
+
+            bool result = await _userAgent.Call(uri, _sipUsername, _sipPassword, mediaSession, ringTimeoutSeconds)
+                .ConfigureAwait(false);
+
+            if (result)
+            {
+                if (!_callDurationTimer.IsRunning)
+                    _callDurationTimer.Restart();
+                IncrementMetric("outbound_calls_answered");
+                Log.Information("Outbound call answered: {Uri}", uri);
+            }
+            else
+            {
+                IncrementMetric("outbound_call_failures");
+                Log.Warning("Outbound call failed or was not answered: {Uri}", uri);
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Exception placing outbound call to {Uri}", uri);
+            ErrorOccurred?.Invoke(this, ex);
+            IncrementMetric("outbound_call_exceptions");
+            return false;
+        }
+    }
+
     public void Hangup()
     {
         if (_isDisposed)
@@ -421,6 +504,7 @@ public class SipClient : IDisposable
 
         try
         {
+            sipUri = SipUriNormalizer.Normalize(sipUri, _sipServer);
             if (!SIPURI.TryParse(sipUri, out var destination))
             {
                 var msg = $"Invalid SIP URI: {sipUri}";
@@ -639,8 +723,17 @@ public class SipClient : IDisposable
     private void CallAnswered(ISIPClientUserAgent uac, SIPResponse sipResponse)
     {
         StatusMessage?.Invoke(this, "Call answered: " + sipResponse.StatusCode + " " + sipResponse.ReasonPhrase + ".");
+        if (!_callDurationTimer.IsRunning)
+            _callDurationTimer.Restart();
         CallAnswer?.Invoke(this);
         IncrementMetric("calls_answered");
+    }
+
+    private void OnDtmfTone(byte tone, int duration)
+    {
+        IncrementMetric("dtmf_received");
+        Log.Information("DTMF tone {Tone} duration {Duration}", tone, duration);
+        DtmfReceived?.Invoke(this, tone, duration);
     }
 
     private void CallFinished(SIPDialogue? dialogue)
