@@ -13,6 +13,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="SipBotLib.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../../SipBotLib.csproj" />
   </ItemGroup>
 

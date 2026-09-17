@@ -2,7 +2,7 @@
 
 Headless SIP/PBX library built on [SIPSorcery](https://github.com/sipsorcery-org/sipsorcery). Register, answer, dial, transfer, DTMF, and PCM audio — **no GUI softphone**.
 
-Coding agents should use the **`sipbot`** CLI/daemon (`tools/sipbot`). The JSON Lines contract, env vars, and flows are in **[AGENTS.md](AGENTS.md)**.
+Coding agents should use the **`sipbot`** CLI/daemon (`tools/sipbot`). The JSON Lines contract, env vars, and flows are in **[AGENTS.md](AGENTS.md)**. Play any PCM/μ-law WAV; `sipbot` resamples to the negotiated codec (PCMU 8 kHz default, G.722 16 kHz unless `--pcmu-only`). The `registered` / `status` / `answered` events include an `audio` object so you do not have to scrape the docs.
 
 `tools/LiveCallTest` is a low-level register → auto-answer → echo harness. Prefer `sipbot serve` for automation.
 

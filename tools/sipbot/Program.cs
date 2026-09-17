@@ -25,7 +25,7 @@ var autoAnswerOpt = new Option<bool>("--auto-answer")
 };
 var playOpt = new Option<string?>("--play")
 {
-    Description = "WAV to play after --auto-answer"
+    Description = "WAV to play after --auto-answer. " + AudioCaps.PlayHelp
 };
 var pcmuOnlyOpt = new Option<bool>("--pcmu-only")
 {
@@ -36,7 +36,7 @@ var noKeepAliveOpt = new Option<bool>("--no-keepalive")
     Description = "Disable continuous outbound RTP keep-alive (NAT pinholes may fail)"
 };
 
-var serve = new Command("serve", "Register with the PBX and run the JSONL control daemon")
+var serve = new Command("serve", "Register with the PBX and run the JSONL control daemon. " + AudioCaps.PlayHelp)
 {
     settingsOpt, configOpt, autoAnswerOpt, playOpt, pcmuOnlyOpt, noKeepAliveOpt
 };
