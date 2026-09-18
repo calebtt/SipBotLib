@@ -2,27 +2,94 @@ namespace SipBot;
 
 /// <summary>
 /// Normalizes transfer/dial targets to a parseable SIP URI.
-/// Accepts a full <c>sip:</c> URI, <c>user@host</c>, or a bare extension.
+/// Accepts a full <c>sip:</c> URI, <c>tel:</c> URI, <c>user@host</c>, a bare extension,
+/// or a PSTN number (E.164 with <c>+</c> and common punctuation).
 /// </summary>
 public static class SipUriNormalizer
 {
     /// <summary>
-    /// Accepts <c>sip:102@host</c>, <c>102@host</c>, or bare <c>102</c>.
-    /// Bare extensions become <c>sip:{extension}@{defaultServer}</c>.
+    /// Accepts <c>sip:102@host</c>, <c>102@host</c>, bare <c>102</c>, <c>tel:+1…</c>,
+    /// or a phone number. Bare extensions become <c>sip:{extension}@{defaultServer}</c>.
+    /// PSTN user parts are reduced to digits (no leading <c>+</c>) so PBX outbound
+    /// routes that match NANP without <c>+</c> still work.
     /// </summary>
     public static string Normalize(string target, string defaultServer)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(target);
         string t = target.Trim();
-        if (t.StartsWith("sip:", StringComparison.OrdinalIgnoreCase))
-            return t;
-        if (t.Contains('@', StringComparison.Ordinal))
-            return "sip:" + t;
+        if (t.StartsWith("tel:", StringComparison.OrdinalIgnoreCase))
+            t = t[4..].Trim();
+        if (t.StartsWith("//", StringComparison.Ordinal))
+            t = t[2..].Trim();
 
         string host = string.IsNullOrWhiteSpace(defaultServer) ? "localhost" : defaultServer.Trim();
         if (host.StartsWith("sip:", StringComparison.OrdinalIgnoreCase))
             host = host[4..];
-        return $"sip:{t}@{host}";
+
+        if (t.StartsWith("sip:", StringComparison.OrdinalIgnoreCase))
+        {
+            string rest = t[4..];
+            int at = rest.IndexOf('@');
+            if (at <= 0)
+                return t;
+            return "sip:" + PstnUserDigits(rest[..at]) + rest[at..];
+        }
+
+        if (t.Contains('@', StringComparison.Ordinal))
+        {
+            int at = t.IndexOf('@');
+            return "sip:" + PstnUserDigits(t[..at]) + t[at..];
+        }
+
+        return $"sip:{PstnUserDigits(t)}@{host}";
+    }
+
+    /// <summary>
+    /// If <paramref name="user"/> looks like a phone number, return digits only;
+    /// otherwise return it unchanged (extensions, SIP usernames).
+    /// </summary>
+    public static string PstnUserDigits(string user)
+    {
+        if (!LooksLikePstn(user))
+            return user;
+        var digits = new string(user.Where(char.IsDigit).ToArray());
+        return digits.Length > 0 ? digits : user;
+    }
+
+    /// <summary>
+    /// True for E.164 / NANP-shaped values (<c>+1…</c>, punctuation, or 10–15 digits).
+    /// Short digit strings such as <c>102</c> stay extensions.
+    /// </summary>
+    public static bool LooksLikePstn(string user)
+    {
+        string s = user.Trim();
+        if (s.Length == 0)
+            return false;
+        int n = 0;
+        bool plus = false;
+        bool punct = false;
+        foreach (char c in s)
+        {
+            if (char.IsDigit(c))
+            {
+                n++;
+                continue;
+            }
+            if (c == '+')
+            {
+                plus = true;
+                continue;
+            }
+            if (c is ' ' or '-' or '(' or ')' or '.' or '/')
+            {
+                punct = true;
+                continue;
+            }
+            return false;
+        }
+        if (n is < 8 or > 15)
+            return false;
+        return plus || punct || n >= 10;
     }
 
     /// <summary>Maps RFC 4733 telephone-event codes to a single DTMF character.</summary>

@@ -97,7 +97,7 @@ Env-only is enough if `SIP_SERVER` and `SIP_USERNAME` are set. Never commit real
 {"cmd":"quit"}
 ```
 
-Transfer / dial targets: bare extension (`102`), `user@host`, or full `sip:` URI. Bare extensions become `sip:{ext}@{SIP_SERVER}`.
+Transfer / dial targets: bare extension (`102`), `user@host`, full `sip:` URI, `tel:` URI, or a PSTN number (`+1…`, punctuation OK). Bare extensions become `sip:{ext}@{SIP_SERVER}`. Phone numbers are reduced to digits (leading `+` stripped) so typical PBX outbound routes match. Dial failure JSONL is `dial failed: <uri> (<SIP status>)` when the far end sent one (e.g. `603 Decline`).
 
 Flags: `--auto-answer`, `--play FILE` (with auto-answer), `--settings PATH`, `--config N`, `--pcmu-only`, `--no-keepalive`. `sipbot serve --help` states the play/resample rule.
 
@@ -126,6 +126,8 @@ Does not publish to nuget.org from this repo by default.
 - NAudio is referenced for **managed** WAV/PCM/μ-law (WDL resampler, `WaveFileReader`). MediaFoundation is not used; Linux agents do not need Windows codecs.
 - Single call at a time per `sipbot` process.
 - Registration must stay up: use `serve`, not a one-shot process that exits after dial.
+- Some PBXs deliver the first inbound INVITE only after OPTIONS qualify; a `registered` event does not always mean the AOR is already reachable.
+- PSTN/cellular DTMF is often in-band; `wait_dtmf` needs RFC 4733 telephone-event.
 
 ## Manual test plan (VitalPBX / local Asterisk)
 

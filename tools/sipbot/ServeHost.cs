@@ -442,7 +442,10 @@ sealed class ServeHost : IDisposable
                 .ConfigureAwait(false);
             if (!connected)
             {
-                Jsonl.Error($"dial failed: {uri}");
+                string? reason = _client.LastOutboundFailure;
+                Jsonl.Error(string.IsNullOrEmpty(reason)
+                    ? $"dial failed: {uri}"
+                    : $"dial failed: {uri} ({reason})");
                 return;
             }
 
