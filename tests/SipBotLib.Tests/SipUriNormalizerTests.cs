@@ -40,6 +40,46 @@ public class SipUriNormalizerTests
     }
 
     [Theory]
+    [InlineData("+\u0661\u0662\u0660\u0662\u0665\u0665\u0665\u0660\u0661\u0660\u0660")]
+    [InlineData("\uff11\uff12\uff10\uff12\uff15\uff15\uff15\uff10\uff11\uff10\uff10")]
+    public void LooksLikePstn_IgnoresNonAsciiDigits(string user)
+    {
+        Assert.False(SipUriNormalizer.LooksLikePstn(user));
+    }
+
+    [Theory]
+    [InlineData("102\r\nX-Injected: yes")]
+    [InlineData("sip:102@pbx.example.com\r\nRecord-Route: sip:evil")]
+    [InlineData("sip:102\r\nX-Foo: bar@pbx.example.com")]
+    [InlineData("102\0@evil.com")]
+    [InlineData("sip:102%0d%0aX-Foo:bar@pbx.example.com")]
+    [InlineData("sip:102%00@pbx.example.com")]
+    [InlineData("sip:102%0A@pbx.example.com")]
+    public void Normalize_RejectsControlCharacters(string input)
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            SipUriNormalizer.Normalize(input, "pbx.example.com"));
+        Assert.Equal("target", ex.ParamName);
+    }
+
+    [Fact]
+    public void Normalize_RejectsControlCharactersInDefaultServer()
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            SipUriNormalizer.Normalize("102", "pbx.example.com\r\nX-Foo: 1"));
+        Assert.Equal("defaultServer", ex.ParamName);
+    }
+
+    [Fact]
+    public void Normalize_RejectsOverlongTarget()
+    {
+        string input = new string('1', SipUriNormalizer.MaxTargetLength + 1);
+        var ex = Assert.Throws<ArgumentException>(() =>
+            SipUriNormalizer.Normalize(input, "pbx.example.com"));
+        Assert.Equal("target", ex.ParamName);
+    }
+
+    [Theory]
     [InlineData(0, '0')]
     [InlineData(5, '5')]
     [InlineData(9, '9')]

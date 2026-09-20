@@ -446,8 +446,19 @@ public class SipClient : IDisposable
         ArgumentNullException.ThrowIfNull(audioSink);
         ArgumentNullException.ThrowIfNull(audioSource);
 
-        string uri = SipUriNormalizer.Normalize(destination, _sipServer);
         LastOutboundFailure = null;
+        string uri;
+        try
+        {
+            uri = SipUriNormalizer.Normalize(destination, _sipServer);
+        }
+        catch (ArgumentException ex)
+        {
+            LastOutboundFailure = ex.Message;
+            Log.Warning(ex, "Rejected outbound destination");
+            return false;
+        }
+
         try
         {
             var mediaSession = CreateMediaSession(CreateMediaEndPoints(audioSink, audioSource));
