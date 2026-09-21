@@ -80,6 +80,12 @@ public class SipClient : IDisposable
     public bool IsRegistered => _isRegistered;
     public bool IsCallActive => _userAgent?.IsCallActive ?? false;
 
+    /// <summary>
+    /// SIP status or error from the last outbound <see cref="CallAsync"/> failure
+    /// (e.g. <c>603 Decline</c>). Null after a successful dial or before any dial.
+    /// </summary>
+    public string? LastOutboundFailure { get; private set; }
+
     private static bool IsLoopbackHost(string host)
     {
         if (string.IsNullOrWhiteSpace(host)) return false;
@@ -411,10 +417,12 @@ public class SipClient : IDisposable
     }
 
     /// <summary>
-    /// Places an outbound call. Destination may be a full SIP URI, <c>user@host</c>, or a bare
-    /// extension (normalized to <c>sip:{ext}@{server}</c>). Media is attached the same way as
-    /// <see cref="Answer"/>. Existing events (<see cref="CallAnswer"/>, <see cref="CallEnded"/>,
-    /// DTMF, status) are raised on the same path as inbound calls.
+    /// Places an outbound call. Destination may be a full SIP URI, <c>tel:</c> URI,
+    /// <c>user@host</c>, a bare extension, or a PSTN number (E.164 <c>+</c> is stripped
+    /// to digits). Media is attached the same way as <see cref="Answer"/>. Existing events
+    /// (<see cref="CallAnswer"/>, <see cref="CallEnded"/>, DTMF, status) are raised on the
+    /// same path as inbound calls. On failure, <see cref="LastOutboundFailure"/> holds the
+    /// SIP status when the far end sent one.
     /// </summary>
     public async Task<bool> CallAsync(
         string destination,
@@ -438,7 +446,19 @@ public class SipClient : IDisposable
         ArgumentNullException.ThrowIfNull(audioSink);
         ArgumentNullException.ThrowIfNull(audioSource);
 
-        string uri = SipUriNormalizer.Normalize(destination, _sipServer);
+        LastOutboundFailure = null;
+        string uri;
+        try
+        {
+            uri = SipUriNormalizer.Normalize(destination, _sipServer);
+        }
+        catch (ArgumentException ex)
+        {
+            LastOutboundFailure = ex.Message;
+            Log.Warning(ex, "Rejected outbound destination");
+            return false;
+        }
+
         try
         {
             var mediaSession = CreateMediaSession(CreateMediaEndPoints(audioSink, audioSource));
@@ -470,13 +490,15 @@ public class SipClient : IDisposable
             else
             {
                 IncrementMetric("outbound_call_failures");
-                Log.Warning("Outbound call failed or was not answered: {Uri}", uri);
+                LastOutboundFailure ??= "not answered";
+                Log.Warning("Outbound call failed or was not answered: {Uri} ({Reason})", uri, LastOutboundFailure);
             }
 
             return result;
         }
         catch (Exception ex)
         {
+            LastOutboundFailure ??= ex.Message;
             Log.Error(ex, "Exception placing outbound call to {Uri}", uri);
             ErrorOccurred?.Invoke(this, ex);
             IncrementMetric("outbound_call_exceptions");
@@ -782,10 +804,13 @@ public class SipClient : IDisposable
 
     private void CallFailed(ISIPClientUserAgent uac, string errorMessage, SIPResponse? failureResponse)
     {
+        LastOutboundFailure = failureResponse != null
+            ? $"{failureResponse.StatusCode} {failureResponse.ReasonPhrase}".Trim()
+            : errorMessage;
         StatusMessage?.Invoke(this, "Call failed: " + errorMessage + ".");
         IncrementMetric("call_failures");
         CallFinished(null);
-        Log.Warning($"Call failed: {errorMessage}");
+        Log.Warning("Call failed: {Error} ({Status})", errorMessage, LastOutboundFailure);
     }
 
     private void CallAnswered(ISIPClientUserAgent uac, SIPResponse sipResponse)
