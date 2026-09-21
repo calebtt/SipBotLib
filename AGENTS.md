@@ -97,7 +97,7 @@ Env-only is enough if `SIP_SERVER` and `SIP_USERNAME` are set. Never commit real
 {"cmd":"quit"}
 ```
 
-Transfer / dial targets: bare extension (`102`), `user@host`, full `sip:` URI, `tel:` URI, or a PSTN number (`+1…`, punctuation OK). Bare extensions become `sip:{ext}@{SIP_SERVER}`. Phone numbers are reduced to digits (leading `+` stripped) so typical PBX outbound routes match. Dial failure JSONL is `dial failed: <uri> (<SIP status>)` when the far end sent one (e.g. `603 Decline`).
+Transfer / dial targets: bare extension (`102`), `user@host`, full `sip:` URI, `tel:` URI, or a PSTN number (`+1…`, punctuation OK). Bare extensions become `sip:{ext}@{SIP_SERVER}`. Phone numbers are reduced to digits (leading `+` stripped) so typical PBX outbound routes match. A `tel:` URI is always that number on `SIP_SERVER`: `;phone-context`, `;ext`, and a trailing `@host` are not a SIP target. Dial failure JSONL is `dial failed: <uri> (<SIP status>)` when the far end sent one (e.g. `603 Decline`).
 
 Flags: `--auto-answer`, `--play FILE` (with auto-answer), `--settings PATH`, `--config N`, `--pcmu-only`, `--no-keepalive`. `sipbot serve --help` states the play/resample rule.
 

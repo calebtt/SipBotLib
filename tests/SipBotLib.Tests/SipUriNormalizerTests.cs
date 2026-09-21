@@ -21,6 +21,12 @@ public class SipUriNormalizerTests
     [InlineData("sip:+12025550100@pbx.example.com:5060", "ignored", "sip:12025550100@pbx.example.com:5060")]
     [InlineData("*97", "pbx.example.com", "sip:*97@pbx.example.com")]
     [InlineData("alice", "pbx.example.com", "sip:alice@pbx.example.com")]
+    [InlineData("tel:+12025550100;phone-context=example.com", "pbx.example.com", "sip:12025550100@pbx.example.com")]
+    [InlineData("tel:+1-202-555-0100;ext=123", "pbx.example.com", "sip:12025550100@pbx.example.com")]
+    [InlineData("tel:+12025550100@other.example", "pbx.example.com", "sip:12025550100@pbx.example.com")]
+    [InlineData("tel://+1 (202) 555-0100;phone-context=example.com", "pbx.example.com", "sip:12025550100@pbx.example.com")]
+    [InlineData("tel:102", "pbx.example.com", "sip:102@pbx.example.com")]
+    [InlineData("tel:*97", "pbx.example.com", "sip:*97@pbx.example.com")]
     public void Normalize_AcceptsCommonForms(string input, string server, string expected)
     {
         Assert.Equal(expected, SipUriNormalizer.Normalize(input, server));
@@ -68,6 +74,18 @@ public class SipUriNormalizerTests
         var ex = Assert.Throws<ArgumentException>(() =>
             SipUriNormalizer.Normalize("102", "pbx.example.com\r\nX-Foo: 1"));
         Assert.Equal("defaultServer", ex.ParamName);
+    }
+
+    [Theory]
+    [InlineData("tel:")]
+    [InlineData("tel:;phone-context=example.com")]
+    [InlineData("tel:sip:alice@other.example")]
+    [InlineData("tel:alice")]
+    public void Normalize_RejectsTelThatIsNotANumber(string input)
+    {
+        var ex = Assert.Throws<ArgumentException>(() =>
+            SipUriNormalizer.Normalize(input, "pbx.example.com"));
+        Assert.Equal("target", ex.ParamName);
     }
 
     [Fact]

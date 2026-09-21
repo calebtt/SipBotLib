@@ -14,6 +14,8 @@ public static class SipUriNormalizer
     /// or a phone number. Bare extensions become <c>sip:{extension}@{defaultServer}</c>.
     /// PSTN user parts are reduced to ASCII digits (no leading <c>+</c>) so PBX outbound
     /// routes that match NANP without <c>+</c> still work.
+    /// A <c>tel:</c> URI is always a number on <paramref name="defaultServer"/>:
+    /// <c>;</c> parameters and a trailing <c>@host</c> are not a SIP target.
     /// </summary>
     public static string Normalize(string target, string defaultServer)
     {
@@ -23,14 +25,15 @@ public static class SipUriNormalizer
             RejectUnsafe(defaultServer, nameof(defaultServer));
 
         string t = target.Trim();
-        if (t.StartsWith("tel:", StringComparison.OrdinalIgnoreCase))
-            t = t[4..].Trim();
-        if (t.StartsWith("//", StringComparison.Ordinal))
-            t = t[2..].Trim();
-
         string host = string.IsNullOrWhiteSpace(defaultServer) ? "localhost" : defaultServer.Trim();
         if (host.StartsWith("sip:", StringComparison.OrdinalIgnoreCase))
             host = host[4..];
+
+        if (t.StartsWith("tel:", StringComparison.OrdinalIgnoreCase))
+            return NormalizeTel(t, host);
+
+        if (t.StartsWith("//", StringComparison.Ordinal))
+            t = t[2..].Trim();
 
         if (t.StartsWith("sip:", StringComparison.OrdinalIgnoreCase))
         {
@@ -48,6 +51,45 @@ public static class SipUriNormalizer
         }
 
         return $"sip:{PstnUserDigits(t)}@{host}";
+    }
+
+    /// <summary>
+    /// <c>tel:</c> subscriber only. Parameters (<c>;phone-context</c>, <c>;ext</c>) and a
+    /// spurious <c>@host</c> are dropped. The number is dialed on <paramref name="host"/>.
+    /// </summary>
+    private static string NormalizeTel(string t, string host)
+    {
+        string subscriber = t[4..].Trim();
+        if (subscriber.StartsWith("//", StringComparison.Ordinal))
+            subscriber = subscriber[2..].Trim();
+
+        int cut = subscriber.Length;
+        foreach (char sep in ";@?")
+        {
+            int i = subscriber.IndexOf(sep);
+            if (i >= 0 && i < cut)
+                cut = i;
+        }
+        if (cut < subscriber.Length)
+            subscriber = subscriber[..cut];
+        subscriber = subscriber.Trim();
+
+        if (subscriber.Length == 0 || !IsTelSubscriber(subscriber))
+            throw new ArgumentException("tel: URI is not a phone number.", "target");
+
+        return $"sip:{PstnUserDigits(subscriber)}@{host}";
+    }
+
+    /// <summary>Digits, visual separators, and <c>*#</c>. Not a SIP user or scheme.</summary>
+    private static bool IsTelSubscriber(string subscriber)
+    {
+        foreach (char c in subscriber)
+        {
+            if (char.IsAsciiDigit(c) || c is '+' or '*' or '#' or ' ' or '-' or '(' or ')' or '.' or '/')
+                continue;
+            return false;
+        }
+        return true;
     }
 
     /// <summary>
