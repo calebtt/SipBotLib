@@ -1101,11 +1101,16 @@ public class SipClient : IDisposable
     /// Extended retry: the agent is stopped (the client owns the retries) and attempts continue
     /// forever, the delay doubling from the initial delay up to the cap.
     /// </remarks>
-    private void ScheduleReconnection()
+    internal void ScheduleReconnection()
     {
         lock (_lockObject)
         {
-            if (_isShutdown || _reconnectPending || _registrationState == RegistrationState.HardFailure)
+            // Checked under the lock: the health check reads the state without it, so by the time
+            // it gets here an attempt it did not know about may already be in flight. Scheduling
+            // then would start an attempt no failure asked for and, in extended mode, stop the
+            // in-flight agent before it can report its result.
+            if (_isShutdown || _reconnectPending
+                || _registrationState is RegistrationState.HardFailure or RegistrationState.Registering)
                 return;
 
             long delay;
