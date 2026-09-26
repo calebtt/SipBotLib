@@ -65,6 +65,7 @@ public class SipClient : IDisposable
     private volatile bool _isShutdown = false;
     private volatile bool _isRegistered = false;
     private int _reconnectionAttempts = 0;
+    private int _outboundRingingRaised;
     private bool _reconnectPending;
     private bool _registrationStarted;
     private RegistrationState _registrationState = RegistrationState.NotStarted;
@@ -103,6 +104,15 @@ public class SipClient : IDisposable
 
     /// <summary>RFC2833 / telephone-event digit (0-9, *, #, A-D). Raised once per complete tone.</summary>
     public event Action<SipClient, char>? DtmfDigitReceived;
+
+    /// <summary>
+    /// Raised once per outbound call (<see cref="CallAsync"/>) when the first ringing response
+    /// arrives: 180 Ringing or 183 Session Progress. The argument is that status code. Not raised
+    /// if the call gets no ringing response. <see cref="CallAsync"/>'s ring timeout starts when the
+    /// INVITE is sent, so a host that wants to time the ring from when the phone rings can pass a
+    /// larger timeout, start its own timer here, and cancel through the CancellationToken.
+    /// </summary>
+    public event Action<SipClient, int>? CallRinging;
 
     // Properties
     /// <summary>
@@ -327,7 +337,7 @@ public class SipClient : IDisposable
     {
         var userAgent = new SIPUserAgent(sipTransport, null);
         userAgent.ClientCallTrying += CallTrying;
-        userAgent.ClientCallRinging += CallRinging;
+        userAgent.ClientCallRinging += OnClientCallRinging;
         userAgent.ClientCallAnswered += CallAnswered;
         userAgent.ClientCallFailed += CallFailed;
         userAgent.OnCallHungup += CallFinished;
@@ -548,6 +558,7 @@ public class SipClient : IDisposable
         ArgumentNullException.ThrowIfNull(audioSource);
 
         LastOutboundFailure = null;
+        Interlocked.Exchange(ref _outboundRingingRaised, 0);
         string uri;
         try
         {
@@ -1008,10 +1019,15 @@ public class SipClient : IDisposable
         IncrementMetric("call_trying");
     }
 
-    private void CallRinging(ISIPClientUserAgent uac, SIPResponse sipResponse)
+    // SIPSorcery routes exactly 180 Ringing and 183 Session Progress here (other provisional
+    // responses go to ClientCallTrying).
+    private void OnClientCallRinging(ISIPClientUserAgent uac, SIPResponse sipResponse)
     {
         StatusMessage?.Invoke(this, "Call ringing: " + sipResponse.StatusCode + " " + sipResponse.ReasonPhrase + ".");
         IncrementMetric("call_ringing");
+
+        if (Interlocked.Exchange(ref _outboundRingingRaised, 1) == 0)
+            CallRinging?.Invoke(this, sipResponse.StatusCode);
     }
 
     private void CallFailed(ISIPClientUserAgent uac, string errorMessage, SIPResponse? failureResponse)
