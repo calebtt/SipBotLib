@@ -145,6 +145,34 @@ public class RegistrationExtendedRetryTests
 }
 
 /// <summary>
+/// The health check leaves an attempt in flight alone. Found live: with REGISTERs being dropped,
+/// the health check (auto-reconnect on) scheduled the next attempt 3 s into the current one, which
+/// stopped the in-flight agent and skipped a backoff step. Here every REGISTER is dropped, each
+/// attempt waits 2 s for a response, and the health check fires every 100 ms.
+/// </summary>
+public class RegistrationHealthCheckInFlightTests
+{
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Health_check_does_not_interrupt_an_attempt_in_flight(bool extended)
+    {
+        using var h = new RegistrationTestHarness(extended: extended, healthMonitoring: true,
+            tune: r => { r.HealthCheckIntervalMs = 100; r.HealthCheckStaleMs = 100; });
+        h.Registrar.Script = Reply.Drop;
+
+        h.Client.StartRegistration();
+        await Task.Delay(TimeSpan.FromSeconds(7));
+
+        // Each attempt runs its full 2 s before the next REGISTER; the health check adds none.
+        double[] gaps = h.GapsMs();
+        Assert.True(gaps.Length >= 2, $"only {gaps.Length + 1} REGISTERs in 7 s");
+        Assert.All(gaps, gap => Assert.True(gap >= 1800, $"gap {gap} ms: an attempt was cut short"));
+        Assert.False(h.SawAlreadyRunning);
+    }
+}
+
+/// <summary>
 /// After a success the extended backoff starts over: the first retry of the next outage comes
 /// after the initial delay again. Waits for a real refresh (25 s), so it is its own class.
 /// </summary>

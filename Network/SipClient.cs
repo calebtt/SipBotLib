@@ -989,9 +989,11 @@ public class SipClient : IDisposable
             var timeSinceLastRegistration = DateTime.UtcNow - _lastSuccessfulRegistration;
 
             // Only after the host has started registration, never after a hard failure (the
-            // registrar rejected the account; retrying would just repeat the rejection), and
-            // never during shutdown.
-            if (!_registrationStarted || _isShutdown || _registrationState == RegistrationState.HardFailure)
+            // registrar rejected the account; retrying would just repeat the rejection), never
+            // while an attempt is in flight (it reports its own result; interrupting it would stop
+            // that agent and skip a backoff step), and never during shutdown.
+            if (!_registrationStarted || _isShutdown
+                || _registrationState is RegistrationState.HardFailure or RegistrationState.Registering)
                 return;
 
             // If we haven't registered successfully recently, try to re-register. Route through
@@ -1004,10 +1006,8 @@ public class SipClient : IDisposable
                     Log.Warning("Health check: no successful registration recently, scheduling re-registration");
                     ScheduleReconnection();
                 }
-                else if (_registrationState != RegistrationState.Registering)
+                else
                 {
-                    // Restart only after the current attempt has failed, so the health check never
-                    // cuts an in-flight REGISTER short.
                     Log.Warning("Health check: no successful registration recently, restarting registration");
                     StartRegistration();
                 }
