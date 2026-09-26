@@ -36,6 +36,32 @@ public static class AudioAlgos
     }
 
     /// <summary>
+    /// Sample provider for a WAV reader. NAudio's ToSampleProvider() only takes PCM and IEEE float,
+    /// so G.711 data (mu-law or A-law) is decoded to 16-bit PCM here first with NAudio's managed
+    /// decoders.
+    /// </summary>
+    private static ISampleProvider WavSampleProvider(WaveFileReader reader)
+    {
+        var format = reader.WaveFormat;
+        if (format.Encoding is not (WaveFormatEncoding.MuLaw or WaveFormatEncoding.ALaw))
+            return reader.ToSampleProvider();
+
+        using var g711 = new MemoryStream();
+        reader.CopyTo(g711);
+        byte[] encoded = g711.ToArray();
+        byte[] pcm = new byte[encoded.Length * 2];
+        bool muLaw = format.Encoding == WaveFormatEncoding.MuLaw;
+        for (int i = 0; i < encoded.Length; i++)
+        {
+            short sample = muLaw ? MuLawDecoder.MuLawToLinearSample(encoded[i]) : ALawDecoder.ALawToLinearSample(encoded[i]);
+            pcm[i * 2] = (byte)sample;
+            pcm[i * 2 + 1] = (byte)(sample >> 8);
+        }
+        var pcmFormat = new WaveFormat(format.SampleRate, 16, format.Channels);
+        return new RawSourceWaveStream(new MemoryStream(pcm), pcmFormat).ToSampleProvider();
+    }
+
+    /// <summary>
     /// Normalizes 16-bit PCM audio to a specified maximum amplitude to prevent clipping.
     /// </summary>
     public static byte[] NormalizePcmAudio(byte[] pcmAudio, float maxAmplitude = 0.9f)
@@ -156,7 +182,7 @@ public static class AudioAlgos
             using var wavStream = new MemoryStream(wavAudio);
             using var reader = new WaveFileReader(wavStream);
 
-            byte[] rawPcm = ResampleSampleProviderToPcm16(reader.ToSampleProvider(), targetSampleRateHz);
+            byte[] rawPcm = ResampleSampleProviderToPcm16(WavSampleProvider(reader), targetSampleRateHz);
             Log.Debug($"Converted WAV to PCM: {rawPcm.Length} bytes, {targetSampleRateHz} Hz, 16-bit mono");
             return rawPcm;
         }
@@ -297,7 +323,7 @@ public static class AudioAlgos
 
             using var wavStream = new FileStream(filePath, FileMode.Open, FileAccess.Read);
             using var reader = new WaveFileReader(wavStream);
-            byte[] pcm8kHz = ResampleSampleProviderToPcm16(reader.ToSampleProvider(), 8000);
+            byte[] pcm8kHz = ResampleSampleProviderToPcm16(WavSampleProvider(reader), 8000);
 
             // Encode to PCMU
             if (pcm8kHz.Length % 2 != 0)
@@ -342,7 +368,7 @@ public static class AudioAlgos
             using var reader = new WaveFileReader(wavStream);
 
             // Resample to 16kHz mono 16-bit PCM
-            byte[] pcm16kHz = ResampleSampleProviderToPcm16(reader.ToSampleProvider(), 16000);
+            byte[] pcm16kHz = ResampleSampleProviderToPcm16(WavSampleProvider(reader), 16000);
             Log.Debug($"Converted WAV to 16kHz PCM: {pcm16kHz.Length} bytes");
             return pcm16kHz;
         }
