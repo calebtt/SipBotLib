@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using SIPSorcery.Media;
 using SIPSorcery.SIP;
@@ -33,6 +34,11 @@ public class BlindTransferTests : IDisposable
     private readonly TaskCompletionSource<bool> _byeAtCallee = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _callerEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _acceptTransfer = true;
+    private bool _sendFinalNotify;
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
+    private readonly TaskCompletionSource<(SIPResponseStatusCodesEnum Status, TimeSpan At)> _notifyAnswered =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TimeSpan _byeAt;
 
     public BlindTransferTests()
     {
@@ -56,11 +62,16 @@ public class BlindTransferTests : IDisposable
         // so OnCallHungup is not a reliable signal here.
         _calleeTransport.SIPTransportRequestReceived += (_, _, req) =>
         {
-            if (req.Method == SIPMethodsEnum.BYE)
-                _byeAtCallee.TrySetResult(true);
+            if (req.Method == SIPMethodsEnum.BYE && _byeAtCallee.TrySetResult(true))
+                _byeAt = _clock.Elapsed;
             return Task.CompletedTask;
         };
-        _callee.OnTransferRequested += (_, _) => _acceptTransfer;
+        _callee.OnTransferRequested += (_, _) =>
+        {
+            if (_acceptTransfer && _sendFinalNotify)
+                _ = SendFinalReferNotifyAsync();
+            return _acceptTransfer;
+        };
 
         var config = new SipConfig { Server = "127.0.0.1", Username = "101", Password = "x" };
         _caller = new SipClient(_callerTransport, config, enableAutoReconnection: false, enableHealthMonitoring: false);
@@ -73,6 +84,27 @@ public class BlindTransferTests : IDisposable
         if (_callee.IsCallActive)
             _callee.Hangup();
         _calleeTransport.Shutdown();
+    }
+
+    /// <summary>
+    /// What Asterisk does after accepting a REFER: an in-dialog NOTIFY (Event: refer) whose
+    /// sipfrag reports the outcome. SIPSorcery's own transferee does not send one.
+    /// </summary>
+    private async Task SendFinalReferNotifyAsync()
+    {
+        await Task.Delay(50); // let the 202 go out first
+        var notify = _callee.Dialogue.GetInDialogRequest(SIPMethodsEnum.NOTIFY);
+        notify.Header.Event = "refer";
+        notify.Header.SubscriptionState = "terminated;reason=noresource";
+        notify.Header.ContentType = "message/sipfrag;version=2.0";
+        notify.Body = "SIP/2.0 200 OK\r\n";
+        var tx = new SIPNonInviteTransaction(_calleeTransport, notify, null);
+        tx.NonInviteTransactionFinalResponseReceived += (_, _, _, resp) =>
+        {
+            _notifyAnswered.TrySetResult((resp.Status, _clock.Elapsed));
+            return Task.FromResult(System.Net.Sockets.SocketError.Success);
+        };
+        tx.SendRequest();
     }
 
     private static async Task<bool> Within(Task task, TimeSpan timeout) =>
@@ -97,6 +129,26 @@ public class BlindTransferTests : IDisposable
         Assert.True(await Within(_callerEnded.Task, TimeSpan.FromSeconds(5)), "CallEnded was not raised after the transfer");
         Assert.False(_caller.IsCallActive);
         Assert.True(await Within(_byeAtCallee.Task, TimeSpan.FromSeconds(5)), "the transferee never received a BYE");
+    }
+
+    [Fact]
+    public async Task Final_progress_NOTIFY_is_answered_before_the_BYE()
+    {
+        _sendFinalNotify = true;
+        await ConnectAsync();
+
+        var elapsed = Stopwatch.StartNew();
+        bool transferred = await _caller.BlindTransferAsync(TransferTarget, TimeSpan.FromSeconds(5));
+        elapsed.Stop();
+
+        Assert.True(transferred);
+        Assert.True(await Within(_notifyAnswered.Task, TimeSpan.FromSeconds(5)), "the NOTIFY got no final response");
+        var (status, answeredAt) = _notifyAnswered.Task.Result;
+        Assert.Equal(SIPResponseStatusCodesEnum.Ok, status);
+        Assert.True(await Within(_byeAtCallee.Task, TimeSpan.FromSeconds(5)), "the transferee never received a BYE");
+        Assert.True(_byeAt >= answeredAt, $"BYE at {_byeAt} came before the NOTIFY was answered at {answeredAt}");
+        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(3), $"BlindTransferAsync took {elapsed.Elapsed}; it should not wait out the cap");
+        Assert.True(_callerEnded.Task.IsCompleted);
     }
 
     [Fact]
