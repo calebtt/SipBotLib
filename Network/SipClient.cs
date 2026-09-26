@@ -35,6 +35,9 @@ public class SipClient : IDisposable
     private const int DefaultRegistrationExpirySeconds = 60;
     private const int BlindTransferTimeoutSeconds = 10;
 
+    /// <summary>How long <see cref="Shutdown"/> waits for the registrar to confirm the unregister.</summary>
+    internal static readonly TimeSpan UnregisterTimeout = TimeSpan.FromSeconds(3);
+
     private readonly string _sipUsername;
     private readonly string _sipPassword;
     private readonly string _sipServer;
@@ -727,11 +730,16 @@ public class SipClient : IDisposable
             mediaSessionToDispose?.Close("Shutdown");
             mediaSessionToDispose?.Dispose();
 
-            _registrationAgent?.Stop();
-            
             StopHealthMonitoring();
-            StopReconnectionTimer();
-            
+            lock (_lockObject)
+            {
+                StopReconnectionTimer();
+            }
+
+            // Unregister before the transport goes away; otherwise the registrar keeps a dead
+            // contact until it expires and forks calls to it.
+            UnregisterBeforeShutdown();
+
             _sipTransport.Shutdown();
             
             IncrementMetric("shutdowns");
@@ -741,6 +749,52 @@ public class SipClient : IDisposable
         {
             Log.Error(ex, "Exception occurred during shutdown");
             ErrorOccurred?.Invoke(this, ex);
+        }
+    }
+
+    /// <summary>
+    /// Sends the unregister (REGISTER with Expires 0) and waits up to
+    /// <see cref="UnregisterTimeout"/> for the registrar to confirm it. The unregister is usually
+    /// challenged (401, then an authenticated retry), so shutting the transport down right after
+    /// <see cref="SIPRegistrationUserAgent.Stop"/> used to lose it. When not registered, the agent
+    /// is just stopped and nothing is sent.
+    /// </summary>
+    private void UnregisterBeforeShutdown()
+    {
+        SIPRegistrationUserAgent agent;
+        bool registered;
+        lock (_lockObject)
+        {
+            agent = _registrationAgent;
+            registered = _isRegistered;
+        }
+
+        if (!registered)
+        {
+            agent.Stop(sendZeroExpiryRegister: false);
+            return;
+        }
+
+        using var done = new ManualResetEventSlim(false);
+        void Removed(SIPURI uri, SIPResponse resp) => done.Set();
+        void Failed(SIPURI uri, SIPResponse resp, string error) => done.Set();
+        agent.RegistrationRemoved += Removed;
+        agent.RegistrationFailed += Failed;
+        agent.RegistrationTemporaryFailure += Failed;
+        try
+        {
+            agent.Stop(sendZeroExpiryRegister: true);
+            if (done.Wait(UnregisterTimeout))
+                Log.Information("Unregistered {User}@{Server}", _sipUsername, _sipServer);
+            else
+                Log.Warning("Unregister of {User}@{Server} not confirmed within {Timeout}; the registrar keeps the contact until it expires",
+                    _sipUsername, _sipServer, UnregisterTimeout);
+        }
+        finally
+        {
+            agent.RegistrationRemoved -= Removed;
+            agent.RegistrationFailed -= Failed;
+            agent.RegistrationTemporaryFailure -= Failed;
         }
     }
 
