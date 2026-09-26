@@ -35,6 +35,12 @@ public class SipClient : IDisposable
     private const int DefaultRegistrationExpirySeconds = 60;
     private const int BlindTransferTimeoutSeconds = 10;
 
+    /// <summary>
+    /// How long <see cref="BlindTransferAsync"/> waits, after the REFER is accepted, for the final
+    /// transfer-progress NOTIFY before it hangs up.
+    /// </summary>
+    internal static readonly TimeSpan TransferNotifyWait = TimeSpan.FromSeconds(5);
+
     /// <summary>How long <see cref="Shutdown"/> waits for the registrar to confirm the unregister.</summary>
     internal static readonly TimeSpan UnregisterTimeout = TimeSpan.FromSeconds(3);
 
@@ -654,6 +660,22 @@ public class SipClient : IDisposable
             return false;
         }
 
+        // The transferee (Asterisk here) reports progress with in-dialog NOTIFYs carrying a sipfrag
+        // ("SIP/2.0 100 Trying" ... "SIP/2.0 200 OK"). SIPUserAgent answers them while the dialog
+        // exists; hanging up before they arrive leaves them unanswered and the PBX retransmits them.
+        // Subscribe before sending the REFER: they can arrive right behind the 202.
+        var finalNotify = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        void OnTransferNotify(string sipfrag)
+        {
+            string statusLine = sipfrag.Split('\n')[0].Trim();
+            if (statusLine.StartsWith("SIP/2.0 ") && statusLine.Length >= 11
+                && int.TryParse(statusLine.AsSpan(8, 3), out int code) && code >= 200)
+            {
+                finalNotify.TrySetResult(statusLine);
+            }
+        }
+        _userAgent.OnTransferNotify += OnTransferNotify;
+
         try
         {
             sipUri = SipUriNormalizer.Normalize(sipUri, _sipServer);
@@ -678,6 +700,13 @@ public class SipClient : IDisposable
                 TransferSucceeded?.Invoke(this);
                 StatusMessage?.Invoke(this, $"Blind transfer to {sipUri} succeeded.");
                 Log.Information($"Blind transfer to {sipUri} succeeded");
+
+                // Let the final progress NOTIFY arrive (and be answered in the dialog) first. Not
+                // every transferee sends one, so the wait is bounded.
+                var first = await Task.WhenAny(finalNotify.Task, Task.Delay(TransferNotifyWait)).ConfigureAwait(false);
+                Log.Information("Transfer progress: {Outcome}", first == finalNotify.Task
+                    ? finalNotify.Task.Result
+                    : $"no final NOTIFY within {TransferNotifyWait.TotalSeconds:0} s");
 
                 // The REFER was accepted, so the transferee now belongs to the transfer target.
                 // PBXs such as Asterisk take this leg out of the bridge but leave it up; end it
@@ -709,6 +738,10 @@ public class SipClient : IDisposable
             ErrorOccurred?.Invoke(this, ex);
             Log.Error(ex, msg);
             return false;
+        }
+        finally
+        {
+            _userAgent.OnTransferNotify -= OnTransferNotify;
         }
     }
 
