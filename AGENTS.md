@@ -99,7 +99,11 @@ Env-only is enough if `SIP_SERVER` and `SIP_USERNAME` are set. Never commit real
 
 Transfer / dial targets: bare extension (`102`), `user@host`, full `sip:` URI, `tel:` URI, or a PSTN number (`+1…`, punctuation OK). Bare extensions become `sip:{ext}@{SIP_SERVER}`. Phone numbers are reduced to digits (leading `+` stripped) so typical PBX outbound routes match. A `tel:` URI is always that number on `SIP_SERVER`: `;phone-context`, `;ext`, and a trailing `@host` are not a SIP target. Dial failure JSONL is `dial failed: <uri> (<SIP status>)` when the far end sent one (e.g. `603 Decline`).
 
-Flags: `--auto-answer`, `--play FILE` (with auto-answer), `--settings PATH`, `--config N`, `--pcmu-only`, `--no-keepalive`. `sipbot serve --help` states the play/resample rule.
+Flags: `--auto-answer`, `--play FILE` (with auto-answer), `--settings PATH`, `--config N`, `--pcmu-only`, `--no-keepalive`, `--extended-retry`, `--sip-trace`. `sipbot serve --help` states the play/resample rule.
+
+**Registration:** `status.registered` is `false` while registration is failing (it used to stay `true` through an outage). After a temporary failure (timeout, 5xx) sipbot retries: by default up to 5 attempts at 2 s × n, then SIPSorcery's own retry every 300 s. `--extended-retry` (or `SIP_EXTENDED_RETRY=1`) retries forever instead, 30 s doubling to at most 5 min; use it for always-on hosts. A hard failure (wrong password, 402, 403, 404) is never retried: restart sipbot after fixing the account. The first stderr line reports `extendedRetry=` and `sipTrace=`.
+
+**SIP trace:** `--sip-trace` (or `SIP_TRACE=1`) logs every SIP message sent and received to stderr. Lab use only: the messages include headers such as digest `Authorization` responses. Off by default. Both switches are read by sipbot only, not by the library's settings loader.
 
 ## Minimal inbound flow
 
