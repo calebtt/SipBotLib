@@ -208,6 +208,7 @@ public class SipClient : IDisposable
             // auto-answer OPTIONS; without a 200 the peer is marked unreachable and callers get
             // busy even though REGISTER succeeded. Confirmed live: OPTIONS to this process on the
             // LAN timed out with zero response before this handler existed.
+            // The same handler answers out-of-dialog NOTIFY (see OnTransportRequestReceived).
             _sipTransport.SIPTransportRequestReceived += OnTransportRequestReceived;
 
             IncrementMetric("transport_initialized");
@@ -222,18 +223,26 @@ public class SipClient : IDisposable
 
     private Task OnTransportRequestReceived(SIPEndPoint localEP, SIPEndPoint remoteEP, SIPRequest req)
     {
-        if (req.Method != SIPMethodsEnum.OPTIONS)
+        // Asterisk sends an unsolicited NOTIFY (Event: message-summary) to the registered
+        // Contact for an extension with a mailbox. It is outside any dialog (no To tag), so
+        // SIPUserAgent ignores it; unanswered, the PBX retransmits it for about 32 s after every
+        // registration. In-dialog NOTIFY (e.g. REFER progress) carries a To tag and is answered
+        // by SIPUserAgent's dialog handling, so it is left alone here.
+        bool outOfDialogNotify = req.Method == SIPMethodsEnum.NOTIFY
+            && string.IsNullOrEmpty(req.Header.To?.ToTag);
+
+        if (req.Method != SIPMethodsEnum.OPTIONS && !outOfDialogNotify)
             return Task.CompletedTask;
 
         try
         {
-            var optionsResponse = SIPResponse.GetResponse(req, SIPResponseStatusCodesEnum.Ok, null);
-            Log.Debug($"Answering OPTIONS from {remoteEP} with 200 OK");
-            return _sipTransport.SendResponseAsync(optionsResponse);
+            var okResponse = SIPResponse.GetResponse(req, SIPResponseStatusCodesEnum.Ok, null);
+            Log.Debug($"Answering {req.Method} from {remoteEP} with 200 OK");
+            return _sipTransport.SendResponseAsync(okResponse);
         }
         catch (Exception ex)
         {
-            Log.Error(ex, $"Failed to answer OPTIONS from {remoteEP}");
+            Log.Error(ex, $"Failed to answer {req.Method} from {remoteEP}");
             return Task.CompletedTask;
         }
     }
