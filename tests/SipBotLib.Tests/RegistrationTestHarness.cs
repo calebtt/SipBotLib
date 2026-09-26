@@ -49,6 +49,8 @@ internal sealed class RegistrationTestHarness : IDisposable
 
     public bool SawAlreadyRunning => Errors.Any(e => e.Message.Contains("already running"));
 
+    public long Metric(string name) => Client.Metrics.TryGetValue(name, out var value) ? value : 0;
+
     public static async Task<bool> WaitUntil(Func<bool> condition, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;

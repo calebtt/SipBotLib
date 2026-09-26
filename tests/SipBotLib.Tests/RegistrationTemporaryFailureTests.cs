@@ -180,6 +180,34 @@ public class RegistrationHealthCheckInFlightTests
 }
 
 /// <summary>
+/// The health check reads the registration state without the lock. If it read TemporaryFailure
+/// just before a scheduled attempt started, its ScheduleReconnection() call arrives while that
+/// attempt is in flight. Seen on the CI runner as more reconnect attempts than failures. The
+/// request must be refused, and the in-flight attempt must still report its own failure.
+/// </summary>
+public class RegistrationScheduleRaceTests
+{
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_late_schedule_request_leaves_the_attempt_in_flight_alone(bool extended)
+    {
+        using var h = new RegistrationTestHarness(extended: extended);
+        h.Registrar.Script = Reply.Drop;
+        h.Client.StartRegistration();
+        Assert.Equal(RegistrationState.Registering, h.Client.RegistrationState);
+
+        h.Client.ScheduleReconnection();
+        await Task.Delay(600);
+
+        Assert.Equal(0, h.Metric("reconnection_attempts"));
+        Assert.Equal(1, h.Registrar.Count);
+        Assert.True(await h.WaitForState(RegistrationState.TemporaryFailure, TimeSpan.FromSeconds(5)),
+            $"the in-flight attempt never reported its failure; state is {h.Client.RegistrationState}");
+    }
+}
+
+/// <summary>
 /// After a success the extended backoff starts over: the first retry of the next outage comes
 /// after the initial delay again. Waits for a real refresh (25 s), so it is its own class.
 /// </summary>
