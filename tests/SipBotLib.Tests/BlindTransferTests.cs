@@ -143,7 +143,7 @@ public class BlindTransferTests : IDisposable
 
         Assert.True(transferred);
         Assert.True(await Within(_notifyAnswered.Task, TimeSpan.FromSeconds(5)), "the NOTIFY got no final response");
-        var (status, answeredAt) = _notifyAnswered.Task.Result;
+        var (status, answeredAt) = await _notifyAnswered.Task;
         Assert.Equal(SIPResponseStatusCodesEnum.Ok, status);
         Assert.True(await Within(_byeAtCallee.Task, TimeSpan.FromSeconds(5)), "the transferee never received a BYE");
         Assert.True(_byeAt >= answeredAt, $"BYE at {_byeAt} came before the NOTIFY was answered at {answeredAt}");
