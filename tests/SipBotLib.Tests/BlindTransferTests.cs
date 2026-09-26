@@ -30,7 +30,7 @@ public class BlindTransferTests : IDisposable
     private readonly SipClient _caller;
     private readonly SIPUserAgent _callee;
     private readonly int _calleePort;
-    private readonly TaskCompletionSource<bool> _calleeHungUp = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _byeAtCallee = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _callerEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _acceptTransfer = true;
 
@@ -51,7 +51,15 @@ public class BlindTransferTests : IDisposable
             };
             await ua.Answer(uas, media);
         };
-        _callee.OnCallHungup += _ => _calleeHungUp.TrySetResult(true);
+        // Watch for the BYE at the transport. After accepting the REFER, SIPUserAgent starts its
+        // own call to the transfer target, which can replace its dialog before the BYE arrives,
+        // so OnCallHungup is not a reliable signal here.
+        _calleeTransport.SIPTransportRequestReceived += (_, _, req) =>
+        {
+            if (req.Method == SIPMethodsEnum.BYE)
+                _byeAtCallee.TrySetResult(true);
+            return Task.CompletedTask;
+        };
         _callee.OnTransferRequested += (_, _) => _acceptTransfer;
 
         var config = new SipConfig { Server = "127.0.0.1", Username = "101", Password = "x" };
@@ -88,7 +96,7 @@ public class BlindTransferTests : IDisposable
         Assert.True(transferred);
         Assert.True(await Within(_callerEnded.Task, TimeSpan.FromSeconds(5)), "CallEnded was not raised after the transfer");
         Assert.False(_caller.IsCallActive);
-        Assert.True(await Within(_calleeHungUp.Task, TimeSpan.FromSeconds(5)), "the transferee never received a BYE");
+        Assert.True(await Within(_byeAtCallee.Task, TimeSpan.FromSeconds(5)), "the transferee never received a BYE");
     }
 
     [Fact]
