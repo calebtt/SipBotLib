@@ -161,4 +161,65 @@ public class SipConfig
 
     [JsonPropertyName("fromname")]
     public string FromName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// How <see cref="SipClient"/> retries registration after a failure. The defaults keep the
+    /// library's original schedule.
+    /// </summary>
+    [JsonPropertyName("registrationRetry")]
+    public RegistrationRetryOptions RegistrationRetry { get; set; } = new();
+}
+
+/// <summary>
+/// Registration retry settings for <see cref="SipClient"/>.
+/// </summary>
+/// <remarks>
+/// A temporary failure (timeout, 5xx, and any status that is not a hard failure) is retried.
+/// A hard failure (401/407 after authentication, 402, 403, 404) is never retried automatically:
+/// the client stops registering until <see cref="SipClient.StartRegistration"/> is called again.
+/// </remarks>
+public class RegistrationRetryOptions
+{
+    /// <summary>
+    /// Extended retry, for always-on hosts: after a temporary failure the client retries forever,
+    /// the delay doubling from <see cref="ExtendedInitialDelayMs"/> up to
+    /// <see cref="ExtendedMaxDelayMs"/>. Off by default.
+    /// </summary>
+    [JsonPropertyName("extended")]
+    public bool Extended { get; set; }
+
+    [JsonPropertyName("extendedInitialDelayMs")]
+    public int ExtendedInitialDelayMs { get; set; } = 30_000;
+
+    [JsonPropertyName("extendedMaxDelayMs")]
+    public int ExtendedMaxDelayMs { get; set; } = 300_000;
+
+    /// <summary>
+    /// Default retry: after a temporary failure the client makes up to this many attempts,
+    /// attempt n after <see cref="DefaultBaseDelayMs"/> × n. After the last one the registration
+    /// agent's own retry stays armed, so the process still recovers without a restart.
+    /// </summary>
+    [JsonPropertyName("defaultMaxAttempts")]
+    public int DefaultMaxAttempts { get; set; } = 5;
+
+    [JsonPropertyName("defaultBaseDelayMs")]
+    public int DefaultBaseDelayMs { get; set; } = 2_000;
+
+    // Timings below are passed through to SIPSorcery or drive the health check. They are not
+    // part of the settings file; tests shorten them.
+
+    /// <summary>Seconds between the registration agent's own retries after a failure (SIPSorcery default 300).</summary>
+    [JsonIgnore]
+    internal int AgentFailureRetrySeconds { get; set; } = 300;
+
+    /// <summary>Seconds the registration agent waits for a REGISTER response (SIPSorcery default 60).</summary>
+    [JsonIgnore]
+    internal int AgentAttemptTimeoutSeconds { get; set; } = 60;
+
+    [JsonIgnore]
+    internal int HealthCheckIntervalMs { get; set; } = 30_000;
+
+    /// <summary>How long registration must be missing before the health check acts.</summary>
+    [JsonIgnore]
+    internal int HealthCheckStaleMs { get; set; } = 120_000;
 }

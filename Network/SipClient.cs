@@ -10,15 +10,29 @@ using System.Diagnostics;
 
 namespace SipBot;
 
+/// <summary>Where <see cref="SipClient"/>'s registration stands.</summary>
+public enum RegistrationState
+{
+    /// <summary><see cref="SipClient.StartRegistration"/> has not been called.</summary>
+    NotStarted,
+    /// <summary>A REGISTER is in progress and no result has arrived yet.</summary>
+    Registering,
+    Registered,
+    /// <summary>The last attempt failed temporarily; a retry is scheduled or the agent's own retry is armed.</summary>
+    TemporaryFailure,
+    /// <summary>
+    /// The registrar rejected the account (401/407 after authentication, 402, 403, 404). Nothing is
+    /// retried until <see cref="SipClient.StartRegistration"/> is called again.
+    /// </summary>
+    HardFailure
+}
+
 /// <summary>
 /// Enhanced SIP client with improved error handling, monitoring, and resource management.
 /// </summary>
 public class SipClient : IDisposable
 {
     private const int DefaultRegistrationExpirySeconds = 60;
-    private const int MaxReconnectionAttempts = 5;
-    private const int ReconnectionDelayMs = 2000;
-    private const int HealthCheckIntervalMs = 30000; // 30 seconds
     private const int BlindTransferTimeoutSeconds = 10;
 
     private readonly string _sipUsername;
@@ -28,6 +42,7 @@ public class SipClient : IDisposable
     private readonly int _registrationExpirySeconds;
     private readonly bool _enableAutoReconnection;
     private readonly bool _enableHealthMonitoring;
+    private readonly RegistrationRetryOptions _retry;
 
     private SIPTransport _sipTransport;
     private SIPUserAgent _userAgent;
@@ -41,6 +56,10 @@ public class SipClient : IDisposable
     private volatile bool _isShutdown = false;
     private volatile bool _isRegistered = false;
     private int _reconnectionAttempts = 0;
+    private bool _reconnectPending;
+    private bool _registrationStarted;
+    private RegistrationState _registrationState = RegistrationState.NotStarted;
+    private string? _lastRegistrationError;
     private Timer? _healthCheckTimer;
     private Timer? _reconnectionTimer;
 
@@ -77,7 +96,19 @@ public class SipClient : IDisposable
     public event Action<SipClient, char>? DtmfDigitReceived;
 
     // Properties
+    /// <summary>
+    /// True after a successful REGISTER. Cleared by any registration failure, temporary or hard,
+    /// so it is false while registration is failing.
+    /// </summary>
     public bool IsRegistered => _isRegistered;
+
+    public RegistrationState RegistrationState => _registrationState;
+
+    /// <summary>
+    /// SIP status (e.g. <c>403 Forbidden</c>) or error text from the most recent registration
+    /// failure. Kept after a later success so the last problem stays visible.
+    /// </summary>
+    public string? LastRegistrationError => _lastRegistrationError;
     public bool IsCallActive => _userAgent?.IsCallActive ?? false;
 
     /// <summary>
@@ -90,6 +121,11 @@ public class SipClient : IDisposable
     {
         if (string.IsNullOrWhiteSpace(host)) return false;
         var h = host.Trim();
+        // Strip a port: "127.0.0.1:5070", "localhost:5070", "[::1]:5070".
+        if (h.StartsWith('[') && h.Contains(']'))
+            h = h[1..h.IndexOf(']')];
+        else if (h.Count(c => c == ':') == 1)
+            h = h[..h.IndexOf(':')];
         if (h.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
         if (h is "127.0.0.1" or "::1") return true;
         return IPAddress.TryParse(h, out var ip) && IPAddress.IsLoopback(ip);
@@ -115,6 +151,7 @@ public class SipClient : IDisposable
         _registrationExpirySeconds = Math.Max(30, registrationExpirySeconds); // Minimum 30 seconds
         _enableAutoReconnection = enableAutoReconnection;
         _enableHealthMonitoring = enableHealthMonitoring;
+        _retry = sipSettings.RegistrationRetry ?? new RegistrationRetryOptions();
 
         InitializeTransport();
         InitializeRegistrationAgent();
@@ -242,19 +279,7 @@ public class SipClient : IDisposable
     {
         try
         {
-            _registrationAgent = new SIPRegistrationUserAgent(
-                _sipTransport,
-                _sipUsername,
-                _sipPassword,
-                _sipServer,
-                _registrationExpirySeconds
-            );
-
-            _registrationAgent.RegistrationSuccessful += OnRegistrationSuccessful;
-            _registrationAgent.RegistrationFailed += OnRegistrationFailed;
-            _registrationAgent.RegistrationTemporaryFailure += OnRegistrationTemporaryFailure;
-            _registrationAgent.RegistrationRemoved += OnRegistrationRemoved;
-
+            _registrationAgent = CreateRegistrationAgent();
             IncrementMetric("registration_agent_initialized");
         }
         catch (Exception ex)
@@ -294,6 +319,62 @@ public class SipClient : IDisposable
         return userAgent;
     }
 
+    private SIPRegistrationUserAgent CreateRegistrationAgent()
+    {
+        var agent = new SIPRegistrationUserAgent(
+            _sipTransport,
+            _sipUsername,
+            _sipPassword,
+            _sipServer,
+            _registrationExpirySeconds,
+            maxRegistrationAttemptTimeout: _retry.AgentAttemptTimeoutSeconds,
+            registerFailureRetryInterval: _retry.AgentFailureRetrySeconds);
+
+        agent.RegistrationSuccessful += OnRegistrationSuccessful;
+        agent.RegistrationFailed += OnRegistrationFailed;
+        agent.RegistrationTemporaryFailure += OnRegistrationTemporaryFailure;
+        agent.RegistrationRemoved += OnRegistrationRemoved;
+        return agent;
+    }
+
+    private void DetachRegistrationAgent(SIPRegistrationUserAgent agent)
+    {
+        agent.RegistrationSuccessful -= OnRegistrationSuccessful;
+        agent.RegistrationFailed -= OnRegistrationFailed;
+        agent.RegistrationTemporaryFailure -= OnRegistrationTemporaryFailure;
+        agent.RegistrationRemoved -= OnRegistrationRemoved;
+    }
+
+    /// <summary>
+    /// Stops the current registration agent without an unregister and detaches it, so it can
+    /// neither send another REGISTER (including SIPSorcery's repeating timer after a hard failure)
+    /// nor report late results. Caller holds <see cref="_lockObject"/>.
+    /// </summary>
+    private void StopRegistrationAgentLocked()
+    {
+        DetachRegistrationAgent(_registrationAgent);
+        _registrationAgent.Stop(sendZeroExpiryRegister: false);
+    }
+
+    /// <summary>
+    /// Stops the current agent (no unregister) and starts a fresh one. A fresh agent never throws
+    /// "already running", and its results cannot be confused with a late event from the old one.
+    /// Caller holds <see cref="_lockObject"/>.
+    /// </summary>
+    private void RestartRegistrationAgentLocked()
+    {
+        StopRegistrationAgentLocked();
+        _registrationAgent = CreateRegistrationAgent();
+        _lastRegistrationAttempt = DateTime.UtcNow;
+        _registrationState = RegistrationState.Registering;
+        _registrationAgent.Start();
+    }
+
+    /// <summary>
+    /// Starts registration, or restarts it if it is already running. Safe to call again at any
+    /// time, including after a hard failure (see <see cref="RegistrationState.HardFailure"/>): the
+    /// current agent is stopped without an unregister, then a new one starts.
+    /// </summary>
     public void StartRegistration()
     {
         if (_isDisposed)
@@ -305,8 +386,10 @@ public class SipClient : IDisposable
         {
             try
             {
-                _lastRegistrationAttempt = DateTime.UtcNow;
-                _registrationAgent.Start();
+                StopReconnectionTimer();
+                _registrationStarted = true;
+                _reconnectionAttempts = 0;
+                RestartRegistrationAgentLocked();
                 StatusMessage?.Invoke(this, $"Registration attempt for {_sipUsername}@{_sipServer} started.");
                 IncrementMetric("registration_attempts");
                 Log.Information($"Starting SIP registration for {_sipUsername}@{_sipServer}");
@@ -727,6 +810,7 @@ public class SipClient : IDisposable
             _isRegistered = true;
             _reconnectionAttempts = 0;
             _lastSuccessfulRegistration = DateTime.UtcNow;
+            _registrationState = RegistrationState.Registered;
         }
 
         StatusMessage?.Invoke(this, $"Registration successful for {uri}. Expires: {resp.Header.Expires}");
@@ -735,31 +819,57 @@ public class SipClient : IDisposable
         Log.Debug($"SIP registration successful for {uri}");
     }
 
-    private void OnRegistrationFailed(SIPURI uri, SIPResponse resp, string error)
+    // SIPSorcery reports some of these as RegistrationFailed and others (e.g. a 402 on the
+    // first REGISTER) as RegistrationTemporaryFailure, so classify by status, not by event.
+    // A 401/407 only surfaces after SIPSorcery has already answered the challenge, i.e. the
+    // credentials were rejected.
+    private static bool IsHardRegistrationFailure(SIPResponse? resp) => resp?.Status is
+        SIPResponseStatusCodesEnum.Unauthorised or
+        SIPResponseStatusCodesEnum.ProxyAuthenticationRequired or
+        SIPResponseStatusCodesEnum.PaymentRequired or
+        SIPResponseStatusCodesEnum.Forbidden or
+        SIPResponseStatusCodesEnum.NotFound;
+
+    private void OnRegistrationFailed(SIPURI uri, SIPResponse resp, string error) =>
+        HandleRegistrationFailure(uri, resp, error);
+
+    private void OnRegistrationTemporaryFailure(SIPURI uri, SIPResponse resp, string error) =>
+        HandleRegistrationFailure(uri, resp, error);
+
+    private void HandleRegistrationFailure(SIPURI uri, SIPResponse? resp, string error)
     {
+        bool hard = IsHardRegistrationFailure(resp);
         lock (_lockObject)
         {
             _isRegistered = false;
+            _lastRegistrationError = resp != null ? $"{(int)resp.Status} {resp.ReasonPhrase}".Trim() : error;
+            if (hard)
+            {
+                // SIPSorcery stops re-arming after a hard failure, but a failure on the first
+                // REGISTER after Start() leaves Start()'s repeating timer running, which would
+                // send the rejected credentials again every (Expires - 5) s. Stop the agent so no
+                // further REGISTER goes out until StartRegistration() is called.
+                _registrationState = RegistrationState.HardFailure;
+                StopReconnectionTimer();
+                StopRegistrationAgentLocked();
+            }
+            else
+            {
+                _registrationState = RegistrationState.TemporaryFailure;
+            }
         }
 
-        StatusMessage?.Invoke(this, $"Registration failed for {uri}: {error}");
+        StatusMessage?.Invoke(this, hard
+            ? $"Registration rejected for {uri}: {error}. Not retrying until StartRegistration() is called."
+            : $"Registration temporary failure for {uri}: {error}");
         RegistrationStatusChanged?.Invoke(this);
-        IncrementMetric("failed_registrations");
-        Log.Warning($"SIP registration failed for {uri}: {error}");
+        IncrementMetric(hard ? "failed_registrations" : "temporary_registration_failures");
+        if (hard)
+            Log.Error("SIP registration rejected for {Uri}: {Error}. Not retrying until StartRegistration() is called", uri, error);
+        else
+            Log.Warning("SIP registration temporary failure for {Uri}: {Error}", uri, error);
 
-        if (_enableAutoReconnection)
-        {
-            ScheduleReconnection();
-        }
-    }
-
-    private void OnRegistrationTemporaryFailure(SIPURI uri, SIPResponse resp, string error)
-    {
-        StatusMessage?.Invoke(this, $"Registration temporary failure for {uri}: {error}");
-        IncrementMetric("temporary_registration_failures");
-        Log.Warning($"SIP registration temporary failure for {uri}: {error}");
-
-        if (_enableAutoReconnection)
+        if (!hard && _enableAutoReconnection)
         {
             ScheduleReconnection();
         }
@@ -770,6 +880,7 @@ public class SipClient : IDisposable
         lock (_lockObject)
         {
             _isRegistered = false;
+            _registrationState = RegistrationState.TemporaryFailure;
         }
 
         StatusMessage?.Invoke(this, $"Registration removed for {uri}");
@@ -861,7 +972,7 @@ public class SipClient : IDisposable
     // Health monitoring and reconnection
     private void StartHealthMonitoring()
     {
-        _healthCheckTimer = new Timer(PerformHealthCheck, null, HealthCheckIntervalMs, HealthCheckIntervalMs);
+        _healthCheckTimer = new Timer(PerformHealthCheck, null, _retry.HealthCheckIntervalMs, _retry.HealthCheckIntervalMs);
         Log.Debug("Health monitoring started");
     }
 
@@ -876,20 +987,28 @@ public class SipClient : IDisposable
         try
         {
             var timeSinceLastRegistration = DateTime.UtcNow - _lastSuccessfulRegistration;
-            
-            // If we haven't registered successfully in the last 2 minutes, try to re-register.
-            // Route through ScheduleReconnection() so this respects the same MaxReconnectionAttempts/
-            // backoff as registration-failure driven reconnects, instead of hammering the server with
-            // an uncapped StartRegistration() call every HealthCheckIntervalMs.
-            if (timeSinceLastRegistration.TotalMinutes > 2 && !_isRegistered)
+
+            // Only after the host has started registration, never after a hard failure (the
+            // registrar rejected the account; retrying would just repeat the rejection), and
+            // never during shutdown.
+            if (!_registrationStarted || _isShutdown || _registrationState == RegistrationState.HardFailure)
+                return;
+
+            // If we haven't registered successfully recently, try to re-register. Route through
+            // ScheduleReconnection() so this respects the same attempt cap and backoff as
+            // failure-driven reconnects, instead of hammering the server every check.
+            if (timeSinceLastRegistration.TotalMilliseconds > _retry.HealthCheckStaleMs && !_isRegistered)
             {
-                Log.Warning("Health check: No successful registration in 2+ minutes, scheduling re-registration");
                 if (_enableAutoReconnection)
                 {
+                    Log.Warning("Health check: no successful registration recently, scheduling re-registration");
                     ScheduleReconnection();
                 }
-                else
+                else if (_registrationState != RegistrationState.Registering)
                 {
+                    // Restart only after the current attempt has failed, so the health check never
+                    // cuts an in-flight REGISTER short.
+                    Log.Warning("Health check: no successful registration recently, restarting registration");
                     StartRegistration();
                 }
             }
@@ -903,22 +1022,54 @@ public class SipClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Schedules one reconnect attempt after a temporary failure. At most one attempt is pending
+    /// at a time, so the health check and failure events cannot stack REGISTERs.
+    /// </summary>
+    /// <remarks>
+    /// Default retry: attempt n after <see cref="RegistrationRetryOptions.DefaultBaseDelayMs"/> × n,
+    /// up to <see cref="RegistrationRetryOptions.DefaultMaxAttempts"/>. After the last, the
+    /// registration agent is left running, so its own retry still recovers the process.
+    /// Extended retry: the agent is stopped (the client owns the retries) and attempts continue
+    /// forever, the delay doubling from the initial delay up to the cap.
+    /// </remarks>
     private void ScheduleReconnection()
     {
         lock (_lockObject)
         {
-            if (_reconnectionAttempts >= MaxReconnectionAttempts)
-            {
-                Log.Error($"Maximum reconnection attempts ({MaxReconnectionAttempts}) reached");
+            if (_isShutdown || _reconnectPending || _registrationState == RegistrationState.HardFailure)
                 return;
-            }
 
-            _reconnectionAttempts++;
-            var delay = ReconnectionDelayMs * _reconnectionAttempts; // Exponential backoff
+            long delay;
+            if (_retry.Extended)
+            {
+                _reconnectionAttempts++;
+                double backoff = _retry.ExtendedInitialDelayMs * Math.Pow(2, Math.Min(_reconnectionAttempts - 1, 30));
+                delay = (long)Math.Min(backoff, _retry.ExtendedMaxDelayMs);
+                StopRegistrationAgentLocked();
+            }
+            else
+            {
+                if (_reconnectionAttempts >= _retry.DefaultMaxAttempts)
+                {
+                    if (_reconnectionAttempts == _retry.DefaultMaxAttempts)
+                    {
+                        _reconnectionAttempts++;
+                        Log.Warning(
+                            "Reconnection attempts ({Max}) used; the registration agent's own retry is still armed",
+                            _retry.DefaultMaxAttempts);
+                    }
+                    return;
+                }
+
+                _reconnectionAttempts++;
+                delay = (long)_retry.DefaultBaseDelayMs * _reconnectionAttempts;
+            }
 
             _reconnectionTimer?.Dispose();
             _reconnectionTimer = new Timer(AttemptReconnection, null, delay, Timeout.Infinite);
-            
+            _reconnectPending = true;
+
             Log.Information($"Scheduling reconnection attempt {_reconnectionAttempts} in {delay}ms");
         }
     }
@@ -927,14 +1078,22 @@ public class SipClient : IDisposable
     {
         _reconnectionTimer?.Dispose();
         _reconnectionTimer = null;
+        _reconnectPending = false;
     }
 
     private void AttemptReconnection(object? state)
     {
         try
         {
-            Log.Information($"Attempting reconnection (attempt {_reconnectionAttempts})");
-            StartRegistration();
+            lock (_lockObject)
+            {
+                _reconnectPending = false;
+                if (_isShutdown || _isDisposed || _registrationState == RegistrationState.HardFailure)
+                    return;
+
+                Log.Information($"Attempting reconnection (attempt {_reconnectionAttempts})");
+                RestartRegistrationAgentLocked();
+            }
             IncrementMetric("reconnection_attempts");
         }
         catch (Exception ex)

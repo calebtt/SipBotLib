@@ -35,13 +35,18 @@ sealed class ServeHost : IDisposable
         var cancellationToken = runCts.Token;
         var cfg = SipBotSettings.LoadActiveConfig(_options.SettingsPath, _options.ConfigIndex);
         int localPort = SipBotSettings.GetLocalBindPort(0);
+        if (_options.ExtendedRetry)
+            cfg.RegistrationRetry.Extended = true;
 
         Log.Information(
-            "sipbot serve user={User} server={Server} localPort={Port} autoAnswer={Auto} keepAlive={KA} wideband={WB}",
-            cfg.Username, cfg.Server, localPort, _options.AutoAnswer, !_options.NoKeepAlive, !_options.PcmuOnly);
+            "sipbot serve user={User} server={Server} localPort={Port} autoAnswer={Auto} keepAlive={KA} wideband={WB} extendedRetry={XR} sipTrace={Trace}",
+            cfg.Username, cfg.Server, localPort, _options.AutoAnswer, !_options.NoKeepAlive, !_options.PcmuOnly,
+            cfg.RegistrationRetry.Extended, _options.SipTrace);
 
         _transport = new SIPTransport();
         _transport.AddSIPChannel(new SIPUDPChannel(IPAddress.Any, localPort));
+        if (_options.SipTrace)
+            EnableSipTrace(_transport);
 
         _client = new SipClient(_transport, cfg, registrationExpirySeconds: 120);
         WireClient(_client);
@@ -79,6 +84,22 @@ sealed class ServeHost : IDisposable
 
     private AgentAudioEndPoint NewEndpoint() =>
         new(!_options.NoKeepAlive, !_options.PcmuOnly);
+
+    /// <summary>
+    /// Lab-only full SIP message trace (--sip-trace / SIP_TRACE). Off by default: the messages
+    /// include SIP headers such as digest Authorization responses.
+    /// </summary>
+    private static void EnableSipTrace(SIPTransport transport)
+    {
+        transport.SIPRequestOutTraceEvent += (_, remote, req) =>
+            Log.Information("SIP >> {Remote}\n{Message}", remote, req.ToString());
+        transport.SIPRequestInTraceEvent += (_, remote, req) =>
+            Log.Information("SIP << {Remote}\n{Message}", remote, req.ToString());
+        transport.SIPResponseOutTraceEvent += (_, remote, resp) =>
+            Log.Information("SIP >> {Remote}\n{Message}", remote, resp.ToString());
+        transport.SIPResponseInTraceEvent += (_, remote, resp) =>
+            Log.Information("SIP << {Remote}\n{Message}", remote, resp.ToString());
+    }
 
     private void WireClient(SipClient client)
     {
@@ -528,6 +549,8 @@ sealed class ServeOptions
     public string? AutoAnswerPlay { get; init; }
     public bool PcmuOnly { get; init; }
     public bool NoKeepAlive { get; init; }
+    public bool ExtendedRetry { get; init; }
+    public bool SipTrace { get; init; }
 }
 
 static class Shutdown
