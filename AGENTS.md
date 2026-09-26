@@ -97,7 +97,7 @@ Env-only is enough if `SIP_SERVER` and `SIP_USERNAME` are set. Never commit real
 {"cmd":"quit"}
 ```
 
-Transfer / dial targets: bare extension (`102`), `user@host`, full `sip:` URI, `tel:` URI, or a PSTN number (`+1…`, punctuation OK). Bare extensions become `sip:{ext}@{SIP_SERVER}`. Phone numbers are reduced to digits (leading `+` stripped) so typical PBX outbound routes match. A `tel:` URI is always that number on `SIP_SERVER`: `;phone-context`, `;ext`, and a trailing `@host` are not a SIP target. Dial failure JSONL is `dial failed: <uri> (<SIP status>)` when the far end sent one (e.g. `603 Decline`).
+Transfer / dial targets: bare extension (`102`), `user@host`, full `sip:` URI, `tel:` URI, or a PSTN number (`+1…`, punctuation OK). Bare extensions become `sip:{ext}@{SIP_SERVER}`. Phone numbers are reduced to digits (leading `+` stripped) so typical PBX outbound routes match. A `tel:` URI is always that number on `SIP_SERVER`: `;phone-context`, `;ext`, and a trailing `@host` are not a SIP target. Dial failure JSONL is `dial failed: <uri> (<SIP status>)` when the far end sent one (e.g. `603 Decline`). After a successful `transfer`, sipbot hangs up its own leg and emits `ended`. A failed transfer emits `error` and the call stays up.
 
 Flags: `--auto-answer`, `--play FILE` (with auto-answer), `--settings PATH`, `--config N`, `--pcmu-only`, `--no-keepalive`, `--extended-retry`, `--sip-trace`. `sipbot serve --help` states the play/resample rule.
 
@@ -140,7 +140,7 @@ Use two extensions (e.g. 101 = sipbot, 102 = a phone or a second client).
 1. **Register:** start `sipbot serve` with env or settings; confirm `registered` on stdout and the PBX shows the peer reachable (OPTIONS qualify).
 2. **Inbound answer:** call 101 from 102; `invite` then `answer` (or `--auto-answer`); far end hears keep-alive/silence or a WAV from `play`.
 3. **DTMF:** from the phone, press digits; expect `dtmf` events. `wait_dtmf` should emit `dtmf_result`.
-4. **Transfer:** while in call, `{"cmd":"transfer","target":"103"}` (or another reachable ext).
+4. **Transfer:** while in call, `{"cmd":"transfer","target":"103"}` (or another reachable ext). Expect `ended` once the transfer is accepted.
 5. **Outbound dial:** `{"cmd":"dial","uri":"102"}`; 102 rings and answers; expect `answered` then `hangup`.
 6. **Shutdown:** Ctrl+C / SIGTERM; process exits without hanging; no `ReadKey`.
 

@@ -678,6 +678,11 @@ public class SipClient : IDisposable
                 TransferSucceeded?.Invoke(this);
                 StatusMessage?.Invoke(this, $"Blind transfer to {sipUri} succeeded.");
                 Log.Information($"Blind transfer to {sipUri} succeeded");
+
+                // The REFER was accepted, so the transferee now belongs to the transfer target.
+                // PBXs such as Asterisk take this leg out of the bridge but leave it up; end it
+                // here (BYE), which raises CallEnded as for any hangup.
+                Hangup();
             }
             else
             {
