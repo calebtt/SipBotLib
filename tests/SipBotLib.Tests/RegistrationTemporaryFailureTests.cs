@@ -152,6 +152,9 @@ public class RegistrationExtendedRetryTests
 /// </summary>
 public class RegistrationHealthCheckInFlightTests
 {
+    private static long Metric(SipClient client, string name) =>
+        client.Metrics.TryGetValue(name, out var value) ? value : 0;
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -164,10 +167,14 @@ public class RegistrationHealthCheckInFlightTests
         h.Client.StartRegistration();
         await Task.Delay(TimeSpan.FromSeconds(7));
 
-        // Each attempt runs its full 2 s before the next REGISTER; the health check adds none.
-        double[] gaps = h.GapsMs();
-        Assert.True(gaps.Length >= 2, $"only {gaps.Length + 1} REGISTERs in 7 s");
-        Assert.All(gaps, gap => Assert.True(gap >= 1800, $"gap {gap} ms: an attempt was cut short"));
+        // Every reconnect attempt must follow a reported failure. An attempt the health check
+        // starts while another is in flight has no failure behind it (it also stops the in-flight
+        // agent, whose failure is then never reported). Counted from the client's own metrics,
+        // so a slow runner that delays a REGISTER cannot fail the test.
+        long failures = Metric(h.Client, "temporary_registration_failures");
+        long attempts = Metric(h.Client, "reconnection_attempts");
+        Assert.True(failures >= 2, $"only {failures} failures in 7 s");
+        Assert.True(attempts <= failures, $"{attempts} reconnect attempts for {failures} failures");
         Assert.False(h.SawAlreadyRunning);
     }
 }
